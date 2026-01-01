@@ -9,7 +9,9 @@ const server = http.createServer(app);
 
 app.use(cors());
 app.use(bodyParser.json());
-
+app.get("/", (req, res) => {
+  res.send("✅ Backend chat fonctionne !");
+});
 app.use("/messages", require("./routes/messages"));
 
 const io = new Server(server, { cors: { origin: "*" } });

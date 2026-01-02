@@ -15,6 +15,30 @@ app.use(bodyParser.json());
 app.get("/", (req, res) => {
   res.send("✅ Backend chat fonctionne (Render)");
 });
+// 🔹 Route pour tester la connexion DB
+app.get("/test-db", (req, res) => {
+  db.getConnection((err, connection) => {
+    if (err) {
+      console.error("❌ Erreur connexion MySQL:", err);
+      return res.status(500).json({
+        error: err.message,
+        code: err.code,
+        sqlMessage: err.sqlMessage,
+        address: err.address,
+        port: err.port
+      });
+    } else {
+      console.log("✅ Connexion MySQL réussie");
+      connection.release();
+      return res.json({ 
+        success: true, 
+        message: "Connexion DB réussie",
+        host: process.env.DB_HOST,
+        port: process.env.DB_PORT
+      });
+    }
+  });
+});
 
 // 🔹 Routes REST
 app.use("/messages", require("./routes/messages"));

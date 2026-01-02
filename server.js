@@ -4,7 +4,7 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const db = require("./db");
-const User = require("./models/User"); // ⬅️ IMPORT AJOUTÉ
+const User = require("./models/User");
 
 const app = express();
 const server = http.createServer(app);
@@ -17,17 +17,45 @@ app.get("/", (req, res) => {
   res.send("✅ Backend chat fonctionne (Render)");
 });
 
-// 🔹 Route pour tester la connexion DB (SÉCURISÉE)
+// 🔹 Route pour voir les utilisateurs connectés et leurs rooms
+app.get("/socket-debug", (req, res) => {
+  const rooms = {};
+  const connectedUsers = [];
+  
+  // Parcourir toutes les sockets connectées
+  io.sockets.sockets.forEach(socket => {
+    connectedUsers.push({
+      id: socket.id,
+      userId: socket.userId || "non enregistré",
+      deviceId: socket.deviceId || "inconnu",
+      rooms: Array.from(socket.rooms)
+    });
+    
+    // Compter par room
+    socket.rooms.forEach(room => {
+      if (!rooms[room]) rooms[room] = 0;
+      rooms[room]++;
+    });
+  });
+  
+  res.json({
+    totalSockets: io.sockets.sockets.size,
+    rooms: rooms,
+    connectedUsers: connectedUsers,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 🔹 Route pour tester la connexion DB
 app.get("/test-db", (req, res) => {
   console.log("🔍 Test DB - Variables d'environnement :", {
     DB_HOST: process.env.DB_HOST,
     DB_PORT: process.env.DB_PORT,
     DB_USER: process.env.DB_USER,
     DB_NAME: process.env.DB_NAME,
-    DB_PASSWORD_SET: !!process.env.DB_PASSWORD // ⬅️ CORRIGÉ : ne pas afficher le mot de passe
+    DB_PASSWORD_SET: !!process.env.DB_PASSWORD
   });
 
-  // Test de connexion directe
   const mysql = require("mysql2");
   
   const testConnection = mysql.createConnection({
@@ -37,7 +65,7 @@ app.get("/test-db", (req, res) => {
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     connectTimeout: 10000,
-    debug: false // ⬅️ Désactivé en production
+    debug: false
   });
 
   testConnection.connect((err) => {
@@ -77,7 +105,7 @@ app.get("/test-db", (req, res) => {
 
 // 🔹 Routes REST
 app.use("/messages", require("./routes/messages"));
-app.use("/users", require("./routes/users")); // ⬅️ DÉPLACÉ ICI
+app.use("/users", require("./routes/users"));
 
 // 🔹 Route de santé
 app.get("/health", (req, res) => {
@@ -88,7 +116,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 🔹 Route de debug (sécurisée)
+// 🔹 Route de debug environnement
 app.get("/debug-env", (req, res) => {
   res.json({
     DB_HOST: process.env.DB_HOST || "NON DÉFINI",
@@ -106,13 +134,17 @@ const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
+  },
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+    skipMiddlewares: true
   }
 });
 
 io.on("connection", (socket) => {
   console.log("🟢 Nouvelle connexion Socket.IO:", socket.id);
 
-  // ⬇️⬇️⬇️ NOUVEAU CODE POUR L'ENREGISTREMENT AUTOMATIQUE ⬇️⬇️⬇️
+  // ========== ENREGISTREMENT DU DEVICE ==========
   socket.on("registerDevice", async (deviceData) => {
     try {
       const { device_id } = deviceData;
@@ -122,112 +154,144 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Trouver ou créer l'utilisateur
       const user = await User.findOrCreate(deviceData);
       
-      console.log(`📱 Téléphone enregistré: ${device_id} -> User ID: ${user.id}`);
+      console.log(`📱 Téléphone ${device_id.substring(0, 20)}... -> User ID: ${user.id}`);
       
-      // Enregistrer l'ID socket avec l'ID utilisateur
+      // Stocker les infos dans la socket
       socket.userId = user.id;
       socket.deviceId = device_id;
       
-      // Rejoindre la room personnelle
+      // Rejoindre la room PERSONNELLE
       socket.join(`user_${user.id}`);
+      console.log(`   ✅ Rejoint room: user_${user.id}`);
       
-      // Confirmer l'enregistrement au client
+      // Notifier le client
       socket.emit("registrationSuccess", {
         user_id: user.id,
         device_id: user.device_id,
         message: "Enregistrement réussi"
       });
 
-      // Notifier que l'utilisateur est en ligne
+      // Notifier les autres que cet utilisateur est en ligne
       socket.broadcast.emit("userOnline", {
         user_id: user.id,
         device_id: user.device_id
       });
 
     } catch (error) {
-      console.error("❌ Erreur enregistrement device:", error);
+      console.error("❌ Erreur enregistrement:", error);
       socket.emit("registrationError", { error: error.message });
     }
   });
 
-  // Ancien 'join' pour compatibilité
-  socket.on("join", (userId) => {
-    socket.join(userId.toString());
-    console.log("➡️ User rejoint la room (ancienne méthode):", userId);
-  });
-
-  // Rejoindre une conversation
+  // ========== REJOINDRE UNE CONVERSATION ==========
   socket.on("joinConversation", (data) => {
-    const { userId, otherUserId } = data;
-    
-    if (socket.userId != userId) {
-      console.warn("⚠️ Tentative de join avec mauvais userId");
+    if (!socket.userId) {
+      console.warn("⚠️ Socket non enregistré, impossible de rejoindre conversation");
+      socket.emit("conversationError", { error: "Utilisateur non enregistré" });
       return;
     }
     
-    // Rejoindre la room de conversation
-    const roomName = `conversation_${Math.min(userId, otherUserId)}_${Math.max(userId, otherUserId)}`;
+    const { otherUserId } = data;
+    
+    if (!otherUserId || otherUserId === socket.userId) {
+      socket.emit("conversationError", { error: "ID destinataire invalide" });
+      return;
+    }
+    
+    // Rejoindre la room de conversation BILATERALE
+    const roomName = `conversation_${Math.min(socket.userId, otherUserId)}_${Math.max(socket.userId, otherUserId)}`;
     socket.join(roomName);
-    console.log(`💬 User ${userId} a rejoint la conversation avec ${otherUserId}`);
+    console.log(`💬 User ${socket.userId} rejoint conversation avec ${otherUserId} (room: ${roomName})`);
+    
+    socket.emit("conversationJoined", {
+      userId: socket.userId,
+      otherUserId,
+      roomName
+    });
   });
 
-  // Envoyer un message
+  // ========== ENVOYER UN MESSAGE ==========
   socket.on("sendMessage", (data) => {
     const { sender_id, receiver_id, message } = data;
 
-    // Vérification pour la nouvelle structure
-    if (socket.userId && socket.userId != sender_id) {
-      console.warn(`⚠️ Tentative d'envoi depuis mauvais user: socket=${socket.userId}, message=${sender_id}`);
-      socket.emit("messageError", { error: "Authentification invalide" });
+    console.log(`📩 Message reçu de ${sender_id} pour ${receiver_id}: "${message.substring(0, 50)}${message.length > 50 ? '...' : ''}"`);
+
+    // Validation
+    if (!sender_id || !receiver_id || !message || !message.trim()) {
+      console.warn("❌ Message invalide:", data);
+      socket.emit("messageError", { error: "Message invalide" });
       return;
     }
 
-    console.log("📩 Message reçu:", { sender_id, receiver_id, message: message.substring(0, 50) + "..." });
+    // Vérifier que l'émetteur est bien connecté (si on a l'info)
+    if (socket.userId && socket.userId !== sender_id) {
+      console.warn(`⚠️ User ${socket.userId} tente d'envoyer comme ${sender_id}`);
+      // On continue quand même pour la compatibilité
+    }
 
-    // Insérer dans la base
+    // Insérer dans la base de données
     db.query(
       "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
-      [sender_id, receiver_id, message],
+      [sender_id, receiver_id, message.trim()],
       (err, result) => {
         if (err) {
           console.error("❌ Erreur MySQL:", err);
-          socket.emit("messageError", { error: "Erreur base de données" });
+          socket.emit("messageError", { 
+            error: "Erreur base de données",
+            details: err.message 
+          });
           return;
         }
 
-        console.log("✅ Message enregistré ID:", result.insertId);
+        console.log(`✅ Message ${result.insertId} enregistré en DB`);
 
         const messageData = {
           id: result.insertId,
           sender_id,
           receiver_id,
-          message,
+          message: message.trim(),
           created_at: new Date(),
           is_read: false
         };
 
-        // Envoyer au receveur (ancienne méthode)
-        io.to(receiver_id.toString()).emit("receiveMessage", messageData);
+        // 🔴 CRITIQUE: ENVOYER AU DESTINATAIRE
+        // 1. Via sa room personnelle (garantie de réception)
+        const recipientRoom = `user_${receiver_id}`;
+        console.log(`📤 Envoi à ${recipientRoom}`);
+        io.to(recipientRoom).emit("receiveMessage", messageData);
         
-        // Envoyer à la room de conversation (nouvelle méthode)
+        // 2. Via la room de conversation (pour les deux participants)
         const conversationRoom = `conversation_${Math.min(sender_id, receiver_id)}_${Math.max(sender_id, receiver_id)}`;
+        console.log(`📤 Envoi aussi à ${conversationRoom}`);
         io.to(conversationRoom).emit("receiveMessage", messageData);
         
-        // Envoyer aussi une notification
-        io.to(`user_${receiver_id}`).emit("newMessageNotification", {
-          ...messageData,
-          sender_device_id: socket.deviceId
+        // 3. Confirmer à l'expéditeur
+        socket.emit("messageSent", {
+          message_id: result.insertId,
+          ...messageData
         });
+
+        // Log de debug
+        const recipientRoomSize = Array.from(io.sockets.adapter.rooms.get(recipientRoom) || []).length;
+        const conversationRoomSize = Array.from(io.sockets.adapter.rooms.get(conversationRoom) || []).length;
+        
+        console.log(`🔍 Rooms: ${recipientRoom}=${recipientRoomSize}, ${conversationRoom}=${conversationRoomSize}`);
       }
     );
   });
 
-  // Récupérer l'historique des messages
+  // ========== RÉCUPÉRER L'HISTORIQUE ==========
   socket.on("getConversation", (data) => {
     const { user1, user2, limit = 50 } = data;
+    
+    if (!user1 || !user2) {
+      socket.emit("conversationError", { error: "IDs utilisateurs manquants" });
+      return;
+    }
+    
+    console.log(`📜 Demande historique ${user1} <-> ${user2}, limit: ${limit}`);
     
     db.query(
       `SELECT m.*, 
@@ -251,6 +315,8 @@ io.on("connection", (socket) => {
         // Inverser l'ordre pour avoir du plus ancien au plus récent
         const messages = results.reverse();
         
+        console.log(`✅ Historique envoyé: ${messages.length} messages`);
+        
         socket.emit("conversationHistory", {
           user1,
           user2,
@@ -260,9 +326,16 @@ io.on("connection", (socket) => {
     );
   });
 
-  // Déconnexion
-  socket.on("disconnect", () => {
-    console.log("🔴 Déconnexion:", socket.id, "User ID:", socket.userId);
+  // ========== ANCIENNE MÉTHODE (pour compatibilité) ==========
+  socket.on("join", (userId) => {
+    // Pour compatibilité avec l'ancien code
+    socket.join(userId.toString());
+    console.log("➡️ User rejoint room (ancienne méthode):", userId);
+  });
+
+  // ========== DÉCONNEXION ==========
+  socket.on("disconnect", (reason) => {
+    console.log(`🔴 Déconnexion: ${socket.id} (user: ${socket.userId || 'inconnu'}) - ${reason}`);
     
     if (socket.userId) {
       // Notifier que l'utilisateur est hors ligne
@@ -272,6 +345,17 @@ io.on("connection", (socket) => {
       });
     }
   });
+
+  // ========== PING/PONG ==========
+  socket.on("ping", () => {
+    socket.emit("pong", { timestamp: new Date().toISOString() });
+  });
+});
+
+// Middleware de logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+  next();
 });
 
 // Log de démarrage
@@ -287,4 +371,5 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Backend lancé sur le port ${PORT}`);
   console.log(`📊 Base de données: ${process.env.DB_NAME} sur ${process.env.DB_HOST}:${process.env.DB_PORT}`);
+  console.log(`🔌 Socket.IO prêt sur /socket.io/`);
 });

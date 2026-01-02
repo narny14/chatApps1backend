@@ -16,27 +16,73 @@ app.get("/", (req, res) => {
   res.send("✅ Backend chat fonctionne (Render)");
 });
 // 🔹 Route pour tester la connexion DB
+// 🔹 Route pour tester la connexion DB (version améliorée)
 app.get("/test-db", (req, res) => {
-  db.getConnection((err, connection) => {
+  console.log("🔍 Test DB - Variables d'environnement :", {
+    DB_HOST: process.env.DB_HOST,
+    DB_PORT: process.env.DB_PORT,
+    DB_USER: process.env.DB_USER,
+    DB_NAME: process.env.DB_NAME,
+    DB_PASSWORD: process.env.DB_PASSWORD ? "hcyWqBlfnvbihFsayzebffBaxXtNihBz" : "MANQUANT"
+  });
+
+  // Test de connexion directe
+  const mysql = require("mysql2");
+  
+  const testConnection = mysql.createConnection({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT || 3306,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    connectTimeout: 10000, // 10 secondes
+    debug: true // Active les logs détaillés
+  });
+
+  testConnection.connect((err) => {
     if (err) {
-      console.error("❌ Erreur connexion MySQL:", err);
-      return res.status(500).json({
-        error: err.message,
+      console.error("❌ ERREUR CONNEXION COMPLÈTE :", {
+        message: err.message,
         code: err.code,
+        errno: err.errno,
+        sqlState: err.sqlState,
         sqlMessage: err.sqlMessage,
         address: err.address,
-        port: err.port
+        port: err.port,
+        fatal: err.fatal,
+        stack: err.stack
       });
-    } else {
-      console.log("✅ Connexion MySQL réussie");
-      connection.release();
-      return res.json({ 
-        success: true, 
-        message: "Connexion DB réussie",
-        host: process.env.DB_HOST,
-        port: process.env.DB_PORT
+      
+      return res.status(500).json({
+        error: "Connexion refusée",
+        details: {
+          code: err.code,
+          errno: err.errno,
+          message: err.message,
+          host: process.env.DB_HOST,
+          port: process.env.DB_PORT,
+          attemptedAt: new Date().toISOString()
+        },
+        config: {
+          host: process.env.DB_HOST,
+          port: process.env.DB_PORT,
+          user: process.env.DB_USER,
+          database: process.env.DB_NAME
+        }
       });
     }
+    
+    console.log("✅ CONNEXION RÉUSSIE !");
+    testConnection.end();
+    
+    res.json({
+      success: true,
+      message: "Connexion à la base de données réussie",
+      database: process.env.DB_NAME,
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT,
+      timestamp: new Date().toISOString()
+    });
   });
 });
 

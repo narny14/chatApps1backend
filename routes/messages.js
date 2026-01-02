@@ -18,9 +18,13 @@ router.post("/", (req, res) => {
 
   db.query(sql, [sender_id, receiver_id, message], (err, result) => {
     if (err) {
-      console.error("❌ Erreur MySQL:", err);
-      return res.status(500).json({ error: "Erreur base de données" });
-    }
+  console.error("❌ Erreur MySQL:", err);
+  return res.status(500).json({
+    error: err.message, // message exact de MySQL
+    code: err.code,     // code d'erreur
+  });
+}
+
 
     res.json({
       success: true,

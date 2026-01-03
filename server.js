@@ -6,7 +6,6 @@ const mysql = require("mysql2/promise");
 const app = express();
 const server = http.createServer(app);
 
-// Configuration DB
 const dbConfig = {
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -20,7 +19,6 @@ const dbConfig = {
 
 const pool = mysql.createPool(dbConfig);
 
-// Middleware
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
@@ -28,21 +26,15 @@ app.use((req, res, next) => {
 });
 app.use(express.json());
 
-// Routes
 app.get("/", (req, res) => res.send("✅ Chat Server Ready"));
 
-// Créer les tables CORRECTES
 app.get("/setup", async (req, res) => {
   try {
     const connection = await pool.getConnection();
     
-    // Supprimer les anciennes tables si elles existent
-    await connection.execute("DROP TABLE IF EXISTS messages");
-    await connection.execute("DROP TABLE IF EXISTS users");
-    
-    // Créer table users CORRECTE
+    // Table users
     await connection.execute(`
-      CREATE TABLE users (
+      CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
         device_id VARCHAR(255) UNIQUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -50,9 +42,9 @@ app.get("/setup", async (req, res) => {
       )
     `);
     
-    // Créer table messages
+    // Table messages
     await connection.execute(`
-      CREATE TABLE messages (
+      CREATE TABLE IF NOT EXISTS messages (
         id INT AUTO_INCREMENT PRIMARY KEY,
         sender_id INT,
         receiver_id INT,
@@ -62,22 +54,22 @@ app.get("/setup", async (req, res) => {
     `);
     
     connection.release();
-    res.json({ success: true, message: "Tables créées avec succès" });
+    res.json({ success: true, message: "Tables créées" });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// SOCKET.IO
+// 🔥 CORRECTION : Stocker les sockets par userId
+const userSockets = new Map(); // { userId: socketId }
+
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
   transports: ["websocket", "polling"]
 });
 
-const activeUsers = new Map();
-
 io.on("connection", (socket) => {
-  console.log(`🟢 Client connecté: ${socket.id}`);
+  console.log(`🟢 Socket connecté: ${socket.id}`);
 
   // ENREGISTREMENT
   socket.on("register", async (data) => {
@@ -91,7 +83,7 @@ io.on("connection", (socket) => {
       
       const connection = await pool.getConnection();
       
-      // Vérifier si l'utilisateur existe déjà
+      // Trouver ou créer l'utilisateur
       const [existing] = await connection.execute(
         "SELECT id FROM users WHERE device_id = ?",
         [deviceId]
@@ -100,13 +92,11 @@ io.on("connection", (socket) => {
       let userId;
       if (existing.length > 0) {
         userId = existing[0].id;
-        // Mettre à jour last_seen
         await connection.execute(
           "UPDATE users SET last_seen = NOW() WHERE id = ?",
           [userId]
         );
       } else {
-        // Créer nouvel utilisateur
         const [result] = await connection.execute(
           "INSERT INTO users (device_id) VALUES (?)",
           [deviceId]
@@ -116,19 +106,17 @@ io.on("connection", (socket) => {
       
       connection.release();
       
-      // Stocker en mémoire
-      activeUsers.set(socket.id, { userId, deviceId });
+      // 🔥 CORRECTION IMPORTANTE : Stocker la socket par userId
+      userSockets.set(userId.toString(), socket.id);
+      socket.userId = userId;
       
-      // Répondre au client
-      socket.emit("register_success", { 
-        userId, 
-        deviceId 
-      });
+      console.log(`✅ User ${userId} enregistré sur socket ${socket.id}`);
       
-      // Envoyer la liste des autres utilisateurs
-      sendUserList(socket, userId);
+      // Répondre
+      socket.emit("register_success", { userId, deviceId });
       
-      console.log(`✅ User ${userId} enregistré (${deviceId.substring(0, 20)}...)`);
+      // Envoyer la liste des utilisateurs
+      broadcastUserList();
       
     } catch (error) {
       console.error("❌ Erreur enregistrement:", error);
@@ -136,13 +124,13 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ENVOYER MESSAGE
+  // ENVOYER MESSAGE - CORRIGÉ
   socket.on("send_message", async (data) => {
     try {
       const { receiverId, message } = data;
-      const sender = activeUsers.get(socket.id);
+      const senderId = socket.userId;
       
-      if (!sender) {
+      if (!senderId) {
         socket.emit("message_error", "Non enregistré");
         return;
       }
@@ -152,12 +140,14 @@ io.on("connection", (socket) => {
         return;
       }
       
+      console.log(`📤 ${senderId} veut envoyer à ${receiverId}: "${message}"`);
+      
       const connection = await pool.getConnection();
       
-      // Insérer le message
+      // Sauvegarder le message
       const [result] = await connection.execute(
         "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
-        [sender.userId, receiverId, message.trim()]
+        [senderId, receiverId, message.trim()]
       );
       
       connection.release();
@@ -165,20 +155,32 @@ io.on("connection", (socket) => {
       // Créer l'objet message
       const messageData = {
         id: result.insertId,
-        sender_id: sender.userId,
+        sender_id: senderId,
         receiver_id: receiverId,
         message: message.trim(),
         created_at: new Date().toISOString()
       };
       
-      // Confirmer à l'expéditeur
+      // 1. Confirmer à l'expéditeur
       socket.emit("message_sent", messageData);
+      console.log(`✅ Message ${result.insertId} sauvegardé en DB`);
       
-      // Envoyer au destinataire s'il est connecté
-      const receiverSocket = findSocketByUserId(receiverId);
-      if (receiverSocket) {
-        io.to(receiverSocket).emit("receive_message", messageData);
-        console.log(`📩 ${sender.userId} → ${receiverId}: "${message.substring(0, 30)}..."`);
+      // 2. 🔥 CORRECTION : Envoyer au destinataire
+      const receiverSocketId = userSockets.get(receiverId.toString());
+      console.log(`🔍 Recherche socket destinataire ${receiverId}: ${receiverSocketId || 'non trouvé'}`);
+      
+      if (receiverSocketId) {
+        // Vérifier si le socket est toujours connecté
+        const receiverSocket = io.sockets.sockets.get(receiverSocketId);
+        if (receiverSocket) {
+          receiverSocket.emit("receive_message", messageData);
+          console.log(`📩 Message envoyé à ${receiverId} (socket: ${receiverSocketId})`);
+        } else {
+          console.log(`⚠️ Socket ${receiverSocketId} trouvé mais pas connecté`);
+          userSockets.delete(receiverId.toString());
+        }
+      } else {
+        console.log(`⚠️ Destinataire ${receiverId} pas connecté`);
       }
       
     } catch (error) {
@@ -187,25 +189,39 @@ io.on("connection", (socket) => {
     }
   });
 
-  // DEMANDER LISTE UTILISATEURS
+  // LISTE UTILISATEURS
   socket.on("get_users", async () => {
     try {
-      const sender = activeUsers.get(socket.id);
-      if (!sender) return;
+      if (!socket.userId) return;
       
-      await sendUserList(socket, sender.userId);
+      const connection = await pool.getConnection();
+      const [users] = await connection.execute(
+        "SELECT id, device_id FROM users WHERE id != ? ORDER BY last_seen DESC",
+        [socket.userId]
+      );
+      
+      connection.release();
+      
+      // Ajouter statut en ligne
+      const usersWithStatus = users.map(user => ({
+        ...user,
+        online: userSockets.has(user.id.toString())
+      }));
+      
+      socket.emit("users_list", usersWithStatus);
+      
     } catch (error) {
       console.error("❌ Erreur get_users:", error);
     }
   });
 
-  // DEMANDER MESSAGES
+  // MESSAGES
   socket.on("get_messages", async (data) => {
     try {
       const { otherUserId } = data;
-      const sender = activeUsers.get(socket.id);
+      const senderId = socket.userId;
       
-      if (!sender) return;
+      if (!senderId) return;
       
       const connection = await pool.getConnection();
       const [messages] = await connection.execute(
@@ -213,13 +229,13 @@ io.on("connection", (socket) => {
          WHERE (sender_id = ? AND receiver_id = ?) 
          OR (sender_id = ? AND receiver_id = ?) 
          ORDER BY created_at ASC`,
-        [sender.userId, otherUserId, otherUserId, sender.userId]
+        [senderId, otherUserId, otherUserId, senderId]
       );
       
       connection.release();
       
       socket.emit("messages_list", {
-        userId: sender.userId,
+        userId: senderId,
         otherUserId,
         messages
       });
@@ -231,56 +247,20 @@ io.on("connection", (socket) => {
 
   // DÉCONNEXION
   socket.on("disconnect", () => {
-    const user = activeUsers.get(socket.id);
-    if (user) {
-      console.log(`🔴 Déconnexion: User ${user.userId}`);
-      activeUsers.delete(socket.id);
-      broadcastActiveUsers();
+    console.log(`🔴 Déconnexion: socket ${socket.id}`);
+    
+    if (socket.userId) {
+      userSockets.delete(socket.userId.toString());
+      broadcastUserList();
     }
   });
 });
 
-// FONCTIONS UTILITAIRES
-async function sendUserList(socket, currentUserId) {
-  try {
-    const connection = await pool.getConnection();
-    const [users] = await connection.execute(
-      "SELECT id, device_id, created_at FROM users WHERE id != ? ORDER BY last_seen DESC",
-      [currentUserId]
-    );
-    
-    connection.release();
-    
-    // Ajouter le statut en ligne
-    const usersWithStatus = users.map(user => ({
-      ...user,
-      online: Array.from(activeUsers.values()).some(u => u.userId === user.id)
-    }));
-    
-    socket.emit("users_list", usersWithStatus);
-  } catch (error) {
-    console.error("❌ Erreur sendUserList:", error);
-  }
+// 🔥 FONCTION POUR DIFFUSER LA LISTE DES UTILISATEURS
+function broadcastUserList() {
+  io.emit("active_users", Array.from(userSockets.keys()));
 }
 
-function findSocketByUserId(userId) {
-  for (const [socketId, user] of activeUsers.entries()) {
-    if (user.userId === userId) return socketId;
-  }
-  return null;
-}
-
-function broadcastActiveUsers() {
-  const onlineUsers = Array.from(activeUsers.values()).map(u => ({
-    id: u.userId,
-    deviceId: u.deviceId,
-    online: true
-  }));
-  
-  io.emit("active_users", onlineUsers);
-}
-
-// DÉMARRAGE
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
   console.log(`🚀 Serveur sur port ${PORT}`);
@@ -289,7 +269,7 @@ server.listen(PORT, async () => {
     const connection = await pool.getConnection();
     await connection.ping();
     connection.release();
-    console.log("✅ Base de données connectée");
+    console.log("✅ DB connectée");
   } catch (error) {
     console.error("❌ Erreur DB:", error.message);
   }

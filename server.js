@@ -168,7 +168,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 1. ENREGISTREMENT DE L'UTILISATEUR
+  // 1. ENREGISTREMENT DE L'UTILISATEUR - VERSION CORRIGÉE
   socket.on("register", async (data) => {
     try {
       const { deviceId } = data;
@@ -185,60 +185,94 @@ io.on("connection", (socket) => {
 
       const connection = await pool.getConnection();
       
-      let [users] = await connection.execute(
-        "SELECT id, device_id FROM users WHERE device_id = ?",
-        [deviceId]
-      );
-      
-      let userId;
-      let userData;
-      
-      if (users.length > 0) {
-        userId = users[0].id;
-        userData = users[0];
-        
-        await connection.execute(
-          "UPDATE users SET last_seen = NOW(), online = 1 WHERE id = ?",
-          [userId]
+      try {
+        // Vérifier si la table a la colonne online
+        const [columns] = await connection.execute(
+          "SHOW COLUMNS FROM users LIKE 'online'"
         );
-      } else {
-        const [result] = await connection.execute(
-          "INSERT INTO users (device_id, online) VALUES (?, 1)",
+        
+        let sqlUpdate;
+        let sqlInsert;
+        
+        if (columns.length > 0) {
+          // Colonne online existe
+          sqlUpdate = "UPDATE users SET last_seen = NOW(), online = 1 WHERE id = ?";
+          sqlInsert = "INSERT INTO users (device_id, online) VALUES (?, 1)";
+        } else {
+          // Colonne online n'existe pas - version de secours
+          console.warn("⚠️ Colonne 'online' non trouvée, utilisation du mode secours");
+          sqlUpdate = "UPDATE users SET last_seen = NOW() WHERE id = ?";
+          sqlInsert = "INSERT INTO users (device_id) VALUES (?)";
+        }
+        
+        let [users] = await connection.execute(
+          "SELECT id, device_id FROM users WHERE device_id = ?",
           [deviceId]
         );
-        userId = result.insertId;
         
-        [users] = await connection.execute(
-          "SELECT id, device_id FROM users WHERE id = ?",
-          [userId]
-        );
-        userData = users[0];
+        let userId;
+        let userData;
+        
+        if (users.length > 0) {
+          userId = users[0].id;
+          userData = users[0];
+          
+          await connection.execute(sqlUpdate, [userId]);
+        } else {
+          const [result] = await connection.execute(sqlInsert, [deviceId]);
+          userId = result.insertId;
+          
+          [users] = await connection.execute(
+            "SELECT id, device_id FROM users WHERE id = ?",
+            [userId]
+          );
+          userData = users[0];
+        }
+        
+        connection.release();
+
+        // Associer l'utilisateur au socket
+        socket.userId = userId;
+        userSockets.set(userId, socket.id);
+        socketUsers.set(socket.id, userId);
+
+        // Joindre une room pour l'utilisateur
+        socket.join(`user:${userId}`);
+        
+        console.log(`✅ Utilisateur ${userId} enregistré sur Render (socket: ${socket.id})`);
+
+        // Envoyer confirmation
+        socket.emit("registered", {
+          success: true,
+          userId,
+          deviceId: userData.device_id,
+          server: "https://chatapps1backend.onrender.com",
+          timestamp: Date.now()
+        });
+
+        // Diffuser la mise à jour
+        broadcastOnlineUsers();
+        sendUsersList(socket);
+
+      } catch (dbError) {
+        connection.release();
+        console.error("❌ Erreur base de données:", dbError);
+        
+        // En cas d'erreur, utiliser un ID temporaire
+        const tempUserId = Math.floor(Math.random() * 10000) + 1000;
+        socket.userId = tempUserId;
+        
+        socket.emit("registered", {
+          success: true,
+          userId: tempUserId,
+          deviceId: deviceId,
+          server: "https://chatapps1backend.onrender.com",
+          timestamp: Date.now(),
+          warning: "Mode secours - données non persistées"
+        });
+        
+        console.log(`⚠️ Mode secours - User ${tempUserId} créé temporairement`);
       }
-      
-      connection.release();
-
-      // Associer l'utilisateur au socket
-      socket.userId = userId;
-      userSockets.set(userId, socket.id);
-      socketUsers.set(socket.id, userId);
-
-      // Joindre une room pour l'utilisateur
-      socket.join(`user:${userId}`);
-      
-      console.log(`✅ Utilisateur ${userId} enregistré sur Render (socket: ${socket.id})`);
-
-      // Envoyer confirmation
-      socket.emit("registered", {
-        success: true,
-        userId,
-        deviceId: userData.device_id,
-        server: "https://chatapps1backend.onrender.com",
-        timestamp: Date.now()
-      });
-
-      // Diffuser la mise à jour
-      broadcastOnlineUsers();
-      sendUsersList(socket);
 
     } catch (error) {
       console.error("❌ Erreur d'enregistrement:", error);
@@ -505,23 +539,38 @@ function broadcastOnlineUsers() {
   });
 }
 
-// Initialiser la base de données
-async function initDB() {
+// Vérifier et corriger le schéma de la base de données
+async function checkDatabaseSchema() {
   try {
     const connection = await pool.getConnection();
     
-    // Table users
+    // Vérifier/Créer la table users
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
         device_id VARCHAR(255) UNIQUE NOT NULL,
         online TINYINT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_online (online),
-        INDEX idx_device_id (device_id)
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
+    
+    // Vérifier si la colonne online existe, sinon l'ajouter
+    try {
+      const [columns] = await connection.execute(
+        "SHOW COLUMNS FROM users LIKE 'online'"
+      );
+      
+      if (columns.length === 0) {
+        console.log("⚠️ Colonne 'online' manquante, ajout...");
+        await connection.execute(
+          "ALTER TABLE users ADD COLUMN online TINYINT DEFAULT 0"
+        );
+        console.log("✅ Colonne 'online' ajoutée à la table users");
+      }
+    } catch (alterError) {
+      console.log("ℹ️ Impossible de vérifier/ajouter la colonne online:", alterError.message);
+    }
     
     // Table messages
     await connection.execute(`
@@ -530,22 +579,22 @@ async function initDB() {
         sender_id INT NOT NULL,
         receiver_id INT NOT NULL,
         message TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_sender (sender_id),
-        INDEX idx_receiver (receiver_id),
-        INDEX idx_conversation (sender_id, receiver_id),
-        INDEX idx_created (created_at),
-        FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
-        FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
     
     connection.release();
-    console.log("✅ Base de données Railway initialisée avec succès");
+    console.log("✅ Schéma de base de données vérifié/corrégé");
     
   } catch (error) {
-    console.error("❌ Erreur d'initialisation DB Railway:", error);
+    console.error("❌ Erreur vérification schéma:", error);
   }
+}
+
+// Initialiser la base de données
+async function initDB() {
+  await checkDatabaseSchema();
+  console.log("✅ Base de données Railway initialisée avec succès");
 }
 
 // Gestion des erreurs

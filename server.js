@@ -2,38 +2,49 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
+require("dotenv").config();
 
 const app = express();
 const server = http.createServer(app);
 
-// Configuration DB
+// Configuration DB Railway
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
+  host: process.env.DB_HOST || "centerbeam.proxy.rlwy.net",
   user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "chat_app",
+  password: process.env.DB_PASSWORD || "hcyWqBlfnvbihFsayzebffBaxXtNihBz",
+  database: process.env.DB_NAME || "railway",
+  port: process.env.DB_PORT || 44341,
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  ssl: {
+    rejectUnauthorized: false // Important pour Railway
+  }
 });
 
 // Stockage en mémoire
 const userSockets = new Map(); // { userId: socketId }
 const socketUsers = new Map(); // { socketId: userId }
 
-app.use(express.json());
-
-// Middleware CORS pour Render
+// Middleware CORS pour production
 app.use((req, res, next) => {
   const allowedOrigins = [
     'https://chatapps1backend.onrender.com',
-    'exp://*', // Pour Expo Go
+    'exp://*',
     'http://localhost:*',
-    'http://192.168.*:*'
+    'http://192.168.*:*',
+    'http://10.0.*:*'
   ];
   
   const origin = req.headers.origin;
-  if (allowedOrigins.some(allowed => origin?.match(allowed) || !origin)) {
+  if (allowedOrigins.some(allowed => {
+    if (origin) {
+      return origin.includes(allowed.replace('*', '')) || 
+             allowed === '*' || 
+             origin === allowed;
+    }
+    return true;
+  })) {
     res.header("Access-Control-Allow-Origin", origin || "*");
   }
   
@@ -48,31 +59,91 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use(express.json());
+
+// Route de santé
 app.get("/", (req, res) => {
   res.json({ 
     status: "OK", 
     message: "Chat Server Running on Render",
     url: "https://chatapps1backend.onrender.com",
-    timestamp: new Date().toISOString()
+    database: process.env.DB_NAME || "railway",
+    timestamp: new Date().toISOString(),
+    onlineUsers: userSockets.size
   });
 });
 
 // API de santé
-app.get("/health", (req, res) => {
-  res.json({
-    status: "healthy",
-    onlineUsers: userSockets.size,
-    timestamp: Date.now()
-  });
+app.get("/health", async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    await connection.ping();
+    connection.release();
+    
+    res.json({
+      status: "healthy",
+      server: "https://chatapps1backend.onrender.com",
+      database: "connected",
+      onlineUsers: userSockets.size,
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "unhealthy",
+      error: error.message,
+      timestamp: Date.now()
+    });
+  }
 });
 
+// API REST pour messages (fallback)
+app.get("/api/messages/:userId/:otherUserId", async (req, res) => {
+  try {
+    const { userId, otherUserId } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    
+    const connection = await pool.getConnection();
+    const [messages] = await connection.execute(
+      `SELECT m.*, 
+              u1.device_id as sender_device_id,
+              u2.device_id as receiver_device_id
+       FROM messages m
+       LEFT JOIN users u1 ON m.sender_id = u1.id
+       LEFT JOIN users u2 ON m.receiver_id = u2.id
+       WHERE (m.sender_id = ? AND m.receiver_id = ?) 
+          OR (m.sender_id = ? AND m.receiver_id = ?)
+       ORDER BY m.created_at DESC
+       LIMIT ?`,
+      [userId, otherUserId, otherUserId, userId, limit]
+    );
+    
+    connection.release();
+    
+    res.json({
+      success: true,
+      messages: messages.reverse(),
+      count: messages.length,
+      server: "https://chatapps1backend.onrender.com"
+    });
+    
+  } catch (error) {
+    console.error("❌ Erreur API messages:", error);
+    res.status(500).json({ 
+      error: error.message,
+      server: "https://chatapps1backend.onrender.com"
+    });
+  }
+});
+
+// Configuration Socket.IO pour production
 const io = new Server(server, {
   cors: {
     origin: [
       "https://chatapps1backend.onrender.com",
       "exp://*",
       "http://localhost:*",
-      "http://192.168.*:*"
+      "http://192.168.*:*",
+      "http://10.0.*:*"
     ],
     methods: ["GET", "POST"],
     credentials: true
@@ -80,16 +151,21 @@ const io = new Server(server, {
   pingTimeout: 60000,
   pingInterval: 25000,
   transports: ["websocket", "polling"],
-  allowEIO3: true
+  allowEIO3: true,
+  path: "/socket.io/"
 });
 
 // Gestion des connexions Socket.IO
 io.on("connection", (socket) => {
   console.log(`🔌 Nouvelle connexion: ${socket.id} depuis ${socket.handshake.address}`);
-
-  // Ping/pong pour garder la connexion active
+  
+  // Ping/pong pour garder la connexion active sur Render
   socket.on("ping", (data) => {
-    socket.emit("pong", { ...data, timestamp: Date.now() });
+    socket.emit("pong", { 
+      ...data, 
+      timestamp: Date.now(),
+      server: "https://chatapps1backend.onrender.com"
+    });
   });
 
   // 1. ENREGISTREMENT DE L'UTILISATEUR
@@ -98,13 +174,15 @@ io.on("connection", (socket) => {
       const { deviceId } = data;
       
       if (!deviceId) {
-        socket.emit("register_error", { error: "deviceId est requis" });
+        socket.emit("register_error", { 
+          error: "deviceId est requis",
+          server: "https://chatapps1backend.onrender.com"
+        });
         return;
       }
 
       console.log(`📱 Enregistrement pour device: ${deviceId.substring(0, 20)}...`);
 
-      // Chercher ou créer l'utilisateur
       const connection = await pool.getConnection();
       
       let [users] = await connection.execute(
@@ -147,27 +225,27 @@ io.on("connection", (socket) => {
       // Joindre une room pour l'utilisateur
       socket.join(`user:${userId}`);
       
-      console.log(`✅ Utilisateur ${userId} enregistré (socket: ${socket.id})`);
+      console.log(`✅ Utilisateur ${userId} enregistré sur Render (socket: ${socket.id})`);
 
-      // Envoyer confirmation au client
+      // Envoyer confirmation
       socket.emit("registered", {
         success: true,
         userId,
         deviceId: userData.device_id,
-        server: "https://chatapps1backend.onrender.com"
+        server: "https://chatapps1backend.onrender.com",
+        timestamp: Date.now()
       });
 
-      // Diffuser la mise à jour des utilisateurs
+      // Diffuser la mise à jour
       broadcastOnlineUsers();
-
-      // Envoyer la liste des utilisateurs disponibles
       sendUsersList(socket);
 
     } catch (error) {
       console.error("❌ Erreur d'enregistrement:", error);
       socket.emit("register_error", { 
         error: "Erreur serveur",
-        details: error.message 
+        details: error.message,
+        server: "https://chatapps1backend.onrender.com"
       });
     }
   });
@@ -176,7 +254,10 @@ io.on("connection", (socket) => {
   socket.on("get_users", async () => {
     try {
       if (!socket.userId) {
-        socket.emit("users_error", { error: "Utilisateur non authentifié" });
+        socket.emit("users_error", { 
+          error: "Utilisateur non authentifié",
+          server: "https://chatapps1backend.onrender.com"
+        });
         return;
       }
       
@@ -184,7 +265,10 @@ io.on("connection", (socket) => {
       
     } catch (error) {
       console.error("❌ Erreur get_users:", error);
-      socket.emit("users_error", { error: error.message });
+      socket.emit("users_error", { 
+        error: error.message,
+        server: "https://chatapps1backend.onrender.com"
+      });
     }
   });
 
@@ -197,28 +281,30 @@ io.on("connection", (socket) => {
       // Validation
       if (!from || !to || !text || text.trim() === "") {
         socket.emit("message_error", { 
-          error: "Données manquantes ou invalides" 
+          error: "Données manquantes ou invalides",
+          server: "https://chatapps1backend.onrender.com"
         });
         return;
       }
       
       if (from.toString() === to.toString()) {
         socket.emit("message_error", { 
-          error: "Impossible de s'envoyer un message à soi-même" 
+          error: "Impossible de s'envoyer un message à soi-même",
+          server: "https://chatapps1backend.onrender.com"
         });
         return;
       }
 
       console.log(`💬 ${from} → ${to}: ${text.substring(0, 50)}...`);
 
-      // Sauvegarder le message en base de données
+      // Sauvegarder en base
       const connection = await pool.getConnection();
       const [result] = await connection.execute(
         "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
         [from, to, text.trim()]
       );
       
-      // Récupérer le message complet avec les infos utilisateur
+      // Récupérer le message complet
       const [messages] = await connection.execute(
         `SELECT m.*, 
                 u1.device_id as sender_device_id,
@@ -235,8 +321,8 @@ io.on("connection", (socket) => {
       const message = messages[0];
       const formattedMessage = {
         id: message.id,
-        sender_id: message.sender_id,
-        receiver_id: message.receiver_id,
+        sender_id: parseInt(message.sender_id),
+        receiver_id: parseInt(message.receiver_id),
         message: message.message,
         created_at: message.created_at,
         sender_device_id: message.sender_device_id,
@@ -244,47 +330,54 @@ io.on("connection", (socket) => {
         server: "https://chatapps1backend.onrender.com"
       };
 
+      console.log(`📊 Message ${message.id} sauvegardé sur Railway`);
+
       // 1. Confirmer à l'expéditeur
       socket.emit("message_sent", {
         success: true,
         message: formattedMessage,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        server: "https://chatapps1backend.onrender.com"
       });
 
-      // 2. Envoyer au destinataire en temps réel
+      // 2. Envoyer au destinataire
       const receiverSocketId = userSockets.get(parseInt(to));
       
       if (receiverSocketId) {
-        // Le destinataire est en ligne
+        console.log(`📤 Envoi en temps réel à ${to} (socket: ${receiverSocketId})`);
+        
         io.to(receiverSocketId).emit("new_message", {
           success: true,
           message: formattedMessage,
           type: "incoming",
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          server: "https://chatapps1backend.onrender.com"
         });
-        
-        console.log(`📩 Message ${message.id} envoyé en temps réel à ${to}`);
       } else {
-        console.log(`⚠️ Destinataire ${to} hors ligne - Message sauvegardé`);
+        console.log(`📭 Destinataire ${to} hors ligne - Message sauvegardé`);
       }
 
     } catch (error) {
       console.error("❌ Erreur send_message:", error);
       socket.emit("message_error", { 
         error: "Erreur d'envoi du message",
-        details: error.message 
+        details: error.message,
+        server: "https://chatapps1backend.onrender.com"
       });
     }
   });
 
-  // 4. CHARGER L'HISTORIQUE DES MESSAGES
+  // 4. CHARGER L'HISTORIQUE
   socket.on("get_messages", async (data) => {
     try {
       const { with: otherUserId, limit = 50 } = data;
       const userId = socket.userId;
       
       if (!userId || !otherUserId) {
-        socket.emit("messages_error", { error: "Paramètres manquants" });
+        socket.emit("messages_error", { 
+          error: "Paramètres manquants",
+          server: "https://chatapps1backend.onrender.com"
+        });
         return;
       }
       
@@ -313,15 +406,18 @@ io.on("connection", (socket) => {
         server: "https://chatapps1backend.onrender.com"
       });
       
-      console.log(`📜 Historique chargé: ${messages.length} messages entre ${userId} et ${otherUserId}`);
+      console.log(`📜 Historique chargé depuis Railway: ${messages.length} messages entre ${userId} et ${otherUserId}`);
       
     } catch (error) {
       console.error("❌ Erreur get_messages:", error);
-      socket.emit("messages_error", { error: error.message });
+      socket.emit("messages_error", { 
+        error: error.message,
+        server: "https://chatapps1backend.onrender.com"
+      });
     }
   });
 
-  // 5. VÉRIFIER LA CONNEXION
+  // 5. HEARTBEAT
   socket.on("heartbeat", () => {
     if (socket.userId) {
       socket.emit("heartbeat_response", {
@@ -339,7 +435,6 @@ io.on("connection", (socket) => {
     const userId = socketUsers.get(socket.id);
     
     if (userId) {
-      // Marquer comme hors ligne dans la base
       try {
         const connection = await pool.getConnection();
         await connection.execute(
@@ -351,13 +446,11 @@ io.on("connection", (socket) => {
         console.error("❌ Erreur mise à jour déconnexion:", error);
       }
       
-      // Nettoyer les maps
       userSockets.delete(userId);
       socketUsers.delete(socket.id);
       
-      // Diffuser la mise à jour
       broadcastOnlineUsers();
-      console.log(`👤 Utilisateur ${userId} déconnecté`);
+      console.log(`👤 Utilisateur ${userId} déconnecté de Render`);
     }
   });
 });
@@ -367,7 +460,6 @@ async function sendUsersList(socket) {
   try {
     const connection = await pool.getConnection();
     
-    // Récupérer tous les utilisateurs sauf soi-même
     const [users] = await connection.execute(
       `SELECT id, device_id, online, 
               DATE_FORMAT(last_seen, '%Y-%m-%d %H:%i:%s') as last_seen
@@ -379,27 +471,29 @@ async function sendUsersList(socket) {
     
     connection.release();
     
-    // Ajouter le statut socket réel
     const usersWithStatus = users.map(user => ({
       ...user,
-      online: userSockets.has(user.id) || user.online === 1,
-      socket_id: userSockets.get(user.id) || null
+      online: userSockets.has(user.id) || user.online === 1
     }));
     
     socket.emit("users", {
       success: true,
       users: usersWithStatus,
       count: usersWithStatus.length,
-      server: "https://chatapps1backend.onrender.com"
+      server: "https://chatapps1backend.onrender.com",
+      timestamp: Date.now()
     });
     
   } catch (error) {
     console.error("❌ Erreur sendUsersList:", error);
-    socket.emit("users_error", { error: error.message });
+    socket.emit("users_error", { 
+      error: error.message,
+      server: "https://chatapps1backend.onrender.com"
+    });
   }
 }
 
-// Fonction pour diffuser la liste des utilisateurs en ligne
+// Fonction pour diffuser les utilisateurs en ligne
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(userSockets.keys());
   
@@ -426,7 +520,7 @@ async function initDB() {
         last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_online (online),
         INDEX idx_device_id (device_id)
-      )
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
     
     // Table messages
@@ -440,21 +534,21 @@ async function initDB() {
         INDEX idx_sender (sender_id),
         INDEX idx_receiver (receiver_id),
         INDEX idx_conversation (sender_id, receiver_id),
-        INDEX idx_created (created_at)
-      )
+        INDEX idx_created (created_at),
+        FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
     
     connection.release();
-    console.log("✅ Base de données initialisée avec succès");
-    console.log("🌐 Serveur prêt sur: https://chatapps1backend.onrender.com");
+    console.log("✅ Base de données Railway initialisée avec succès");
     
   } catch (error) {
-    console.error("❌ Erreur d'initialisation DB:", error);
-    process.exit(1);
+    console.error("❌ Erreur d'initialisation DB Railway:", error);
   }
 }
 
-// Gestion des erreurs non capturées
+// Gestion des erreurs
 process.on("uncaughtException", (error) => {
   console.error("⚠️ Exception non capturée:", error);
 });
@@ -463,10 +557,11 @@ process.on("unhandledRejection", (reason, promise) => {
   console.error("⚠️ Rejet non géré:", reason);
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
-  console.log(`🔗 URL HTTP: https://chatapps1backend.onrender.com`);
+  console.log(`🚀 Serveur démarré sur Render, port ${PORT}`);
+  console.log(`🔗 URL HTTPS: https://chatapps1backend.onrender.com`);
   console.log(`📡 URL WebSocket: wss://chatapps1backend.onrender.com`);
+  console.log(`🗄️  Database: ${process.env.DB_HOST}:${process.env.DB_PORT}`);
   initDB();
 });

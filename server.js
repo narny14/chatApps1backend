@@ -7,7 +7,6 @@ require("dotenv").config();
 const app = express();
 const server = http.createServer(app);
 
-// Configuration DB Railway
 const pool = mysql.createPool({
   host: process.env.DB_HOST || "centerbeam.proxy.rlwy.net",
   user: process.env.DB_USER || "root",
@@ -18,15 +17,13 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
   ssl: {
-    rejectUnauthorized: false // Important pour Railway
+    rejectUnauthorized: false
   }
 });
 
-// Stockage en mémoire
-const userSockets = new Map(); // { userId: socketId }
-const socketUsers = new Map(); // { socketId: userId }
+const userSockets = new Map();
+const socketUsers = new Map();
 
-// Middleware CORS pour production
 app.use((req, res, next) => {
   const allowedOrigins = [
     'https://chatapps1backend.onrender.com',
@@ -61,7 +58,6 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Route de santé
 app.get("/", (req, res) => {
   res.json({ 
     status: "OK", 
@@ -73,7 +69,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// API de santé
 app.get("/health", async (req, res) => {
   try {
     const connection = await pool.getConnection();
@@ -96,7 +91,6 @@ app.get("/health", async (req, res) => {
   }
 });
 
-// API REST pour messages (fallback)
 app.get("/api/messages/:userId/:otherUserId", async (req, res) => {
   try {
     const { userId, otherUserId } = req.params;
@@ -135,7 +129,6 @@ app.get("/api/messages/:userId/:otherUserId", async (req, res) => {
   }
 });
 
-// Configuration Socket.IO pour production
 const io = new Server(server, {
   cors: {
     origin: [
@@ -155,11 +148,9 @@ const io = new Server(server, {
   path: "/socket.io/"
 });
 
-// Gestion des connexions Socket.IO
 io.on("connection", (socket) => {
   console.log(`🔌 Nouvelle connexion: ${socket.id} depuis ${socket.handshake.address}`);
   
-  // Ping/pong pour garder la connexion active sur Render
   socket.on("ping", (data) => {
     socket.emit("pong", { 
       ...data, 
@@ -168,7 +159,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 1. ENREGISTREMENT DE L'UTILISATEUR - VERSION CORRIGÉE
+  // 1. ENREGISTREMENT
   socket.on("register", async (data) => {
     try {
       const { deviceId } = data;
@@ -186,25 +177,6 @@ io.on("connection", (socket) => {
       const connection = await pool.getConnection();
       
       try {
-        // Vérifier si la table a la colonne online
-        const [columns] = await connection.execute(
-          "SHOW COLUMNS FROM users LIKE 'online'"
-        );
-        
-        let sqlUpdate;
-        let sqlInsert;
-        
-        if (columns.length > 0) {
-          // Colonne online existe
-          sqlUpdate = "UPDATE users SET last_seen = NOW(), online = 1 WHERE id = ?";
-          sqlInsert = "INSERT INTO users (device_id, online) VALUES (?, 1)";
-        } else {
-          // Colonne online n'existe pas - version de secours
-          console.warn("⚠️ Colonne 'online' non trouvée, utilisation du mode secours");
-          sqlUpdate = "UPDATE users SET last_seen = NOW() WHERE id = ?";
-          sqlInsert = "INSERT INTO users (device_id) VALUES (?)";
-        }
-        
         let [users] = await connection.execute(
           "SELECT id, device_id FROM users WHERE device_id = ?",
           [deviceId]
@@ -217,9 +189,15 @@ io.on("connection", (socket) => {
           userId = users[0].id;
           userData = users[0];
           
-          await connection.execute(sqlUpdate, [userId]);
+          await connection.execute(
+            "UPDATE users SET last_seen = NOW(), online = 1 WHERE id = ?",
+            [userId]
+          );
         } else {
-          const [result] = await connection.execute(sqlInsert, [deviceId]);
+          const [result] = await connection.execute(
+            "INSERT INTO users (device_id, online) VALUES (?, 1)",
+            [deviceId]
+          );
           userId = result.insertId;
           
           [users] = await connection.execute(
@@ -231,17 +209,14 @@ io.on("connection", (socket) => {
         
         connection.release();
 
-        // Associer l'utilisateur au socket
         socket.userId = userId;
         userSockets.set(userId, socket.id);
         socketUsers.set(socket.id, userId);
 
-        // Joindre une room pour l'utilisateur
         socket.join(`user:${userId}`);
         
-        console.log(`✅ Utilisateur ${userId} enregistré sur Render (socket: ${socket.id})`);
+        console.log(`✅ Utilisateur ${userId} enregistré (socket: ${socket.id})`);
 
-        // Envoyer confirmation
         socket.emit("registered", {
           success: true,
           userId,
@@ -250,7 +225,6 @@ io.on("connection", (socket) => {
           timestamp: Date.now()
         });
 
-        // Diffuser la mise à jour
         broadcastOnlineUsers();
         sendUsersList(socket);
 
@@ -258,7 +232,6 @@ io.on("connection", (socket) => {
         connection.release();
         console.error("❌ Erreur base de données:", dbError);
         
-        // En cas d'erreur, utiliser un ID temporaire
         const tempUserId = Math.floor(Math.random() * 10000) + 1000;
         socket.userId = tempUserId;
         
@@ -306,13 +279,12 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 3. ENVOYER UN MESSAGE
+  // 3. ENVOYER UN MESSAGE - VERSION AMÉLIORÉE
   socket.on("send_message", async (data) => {
     try {
       const { to, text } = data;
       const from = socket.userId;
       
-      // Validation
       if (!from || !to || !text || text.trim() === "") {
         socket.emit("message_error", { 
           error: "Données manquantes ou invalides",
@@ -331,14 +303,12 @@ io.on("connection", (socket) => {
 
       console.log(`💬 ${from} → ${to}: ${text.substring(0, 50)}...`);
 
-      // Sauvegarder en base
       const connection = await pool.getConnection();
       const [result] = await connection.execute(
         "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
         [from, to, text.trim()]
       );
       
-      // Récupérer le message complet
       const [messages] = await connection.execute(
         `SELECT m.*, 
                 u1.device_id as sender_device_id,
@@ -364,7 +334,7 @@ io.on("connection", (socket) => {
         server: "https://chatapps1backend.onrender.com"
       };
 
-      console.log(`📊 Message ${message.id} sauvegardé sur Railway`);
+      console.log(`📊 Message ${message.id} sauvegardé`);
 
       // 1. Confirmer à l'expéditeur
       socket.emit("message_sent", {
@@ -387,8 +357,22 @@ io.on("connection", (socket) => {
           timestamp: Date.now(),
           server: "https://chatapps1backend.onrender.com"
         });
+        
+        // Informer l'expéditeur que le destinataire est en ligne
+        socket.emit("message_delivered", {
+          messageId: message.id,
+          receiverOnline: true,
+          timestamp: Date.now()
+        });
       } else {
         console.log(`📭 Destinataire ${to} hors ligne - Message sauvegardé`);
+        
+        // Informer l'expéditeur que le destinataire est hors ligne
+        socket.emit("message_delivered", {
+          messageId: message.id,
+          receiverOnline: false,
+          timestamp: Date.now()
+        });
       }
 
     } catch (error) {
@@ -440,7 +424,7 @@ io.on("connection", (socket) => {
         server: "https://chatapps1backend.onrender.com"
       });
       
-      console.log(`📜 Historique chargé depuis Railway: ${messages.length} messages entre ${userId} et ${otherUserId}`);
+      console.log(`📜 Historique chargé: ${messages.length} messages entre ${userId} et ${otherUserId}`);
       
     } catch (error) {
       console.error("❌ Erreur get_messages:", error);
@@ -484,12 +468,11 @@ io.on("connection", (socket) => {
       socketUsers.delete(socket.id);
       
       broadcastOnlineUsers();
-      console.log(`👤 Utilisateur ${userId} déconnecté de Render`);
+      console.log(`👤 Utilisateur ${userId} déconnecté`);
     }
   });
 });
 
-// Fonction pour envoyer la liste des utilisateurs
 async function sendUsersList(socket) {
   try {
     const connection = await pool.getConnection();
@@ -527,7 +510,6 @@ async function sendUsersList(socket) {
   }
 }
 
-// Fonction pour diffuser les utilisateurs en ligne
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(userSockets.keys());
   
@@ -539,12 +521,10 @@ function broadcastOnlineUsers() {
   });
 }
 
-// Vérifier et corriger le schéma de la base de données
 async function checkDatabaseSchema() {
   try {
     const connection = await pool.getConnection();
     
-    // Vérifier/Créer la table users
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -555,24 +535,6 @@ async function checkDatabaseSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
     
-    // Vérifier si la colonne online existe, sinon l'ajouter
-    try {
-      const [columns] = await connection.execute(
-        "SHOW COLUMNS FROM users LIKE 'online'"
-      );
-      
-      if (columns.length === 0) {
-        console.log("⚠️ Colonne 'online' manquante, ajout...");
-        await connection.execute(
-          "ALTER TABLE users ADD COLUMN online TINYINT DEFAULT 0"
-        );
-        console.log("✅ Colonne 'online' ajoutée à la table users");
-      }
-    } catch (alterError) {
-      console.log("ℹ️ Impossible de vérifier/ajouter la colonne online:", alterError.message);
-    }
-    
-    // Table messages
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS messages (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -584,20 +546,18 @@ async function checkDatabaseSchema() {
     `);
     
     connection.release();
-    console.log("✅ Schéma de base de données vérifié/corrégé");
+    console.log("✅ Schéma de base de données vérifié");
     
   } catch (error) {
     console.error("❌ Erreur vérification schéma:", error);
   }
 }
 
-// Initialiser la base de données
 async function initDB() {
   await checkDatabaseSchema();
-  console.log("✅ Base de données Railway initialisée avec succès");
+  console.log("✅ Base de données initialisée");
 }
 
-// Gestion des erreurs
 process.on("uncaughtException", (error) => {
   console.error("⚠️ Exception non capturée:", error);
 });

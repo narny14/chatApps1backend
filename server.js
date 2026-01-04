@@ -6,7 +6,7 @@ const mysql = require("mysql2/promise");
 const app = express();
 const server = http.createServer(app);
 
-// Configuration de la base de données
+// Configuration DB
 const dbConfig = {
   host: process.env.DB_HOST || "localhost",
   user: process.env.DB_USER || "root",
@@ -14,7 +14,7 @@ const dbConfig = {
   database: process.env.DB_NAME || "chat_app",
   port: process.env.DB_PORT || 3306,
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: 20,
   queueLimit: 0
 };
 
@@ -22,9 +22,9 @@ const pool = mysql.createPool(dbConfig);
 
 // Stockage des connexions
 const connectedUsers = new Map(); // userId -> socketId
-const userSockets = new Map(); // socketId -> {userId, deviceId}
+const userDevices = new Map(); // userId -> deviceInfo
 
-// Middleware CORS
+// Middleware
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
@@ -33,10 +33,10 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 app.get("/", (req, res) => {
-  res.json({
-    status: "online",
-    users: connectedUsers.size,
-    message: "Chat Server Running"
+  res.json({ 
+    status: "online", 
+    connectedUsers: connectedUsers.size,
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -48,187 +48,226 @@ const io = new Server(server, {
     credentials: true
   },
   transports: ["websocket", "polling"],
-  pingTimeout: 20000,
-  pingInterval: 10000,
-  connectTimeout: 30000
+  pingTimeout: 30000,
+  pingInterval: 15000,
+  connectTimeout: 20000
 });
 
-// Diffuser les utilisateurs en ligne
+// Fonction pour diffuser les utilisateurs en ligne
 const broadcastOnlineUsers = () => {
   try {
-    const onlineUsers = Array.from(connectedUsers.keys());
+    const onlineUserIds = Array.from(connectedUsers.keys());
     
-    io.emit("active_users", {
-      onlineUsers: onlineUsers,
-      timestamp: Date.now(),
-      total: onlineUsers.length
+    io.emit("active_users_update", {
+      onlineUsers: onlineUserIds,
+      timestamp: Date.now()
     });
     
-    console.log(`📢 Diffusé: ${onlineUsers.length} utilisateurs en ligne`);
+    // Notifier chaque utilisateur individuellement
+    onlineUserIds.forEach(userId => {
+      const socketId = connectedUsers.get(userId);
+      if (socketId) {
+        io.to(socketId).emit("user_status_update", {
+          userId,
+          online: true
+        });
+      }
+    });
+    
+    console.log(`📢 ${onlineUserIds.length} utilisateurs en ligne`);
   } catch (error) {
-    console.error("❌ Erreur broadcastOnlineUsers:", error);
+    console.error("❌ Erreur broadcast:", error);
   }
 };
 
 io.on("connection", (socket) => {
   console.log(`🔌 Nouvelle connexion: ${socket.id}`);
 
-  // Enregistrement d'un utilisateur
-  socket.on("register", async (data) => {
+  // Enregistrement utilisateur
+  socket.on("register_user", async (data) => {
     try {
-      const { deviceId } = data;
+      const { deviceId, userId: existingUserId } = data;
       
       if (!deviceId) {
-        socket.emit("register_error", "Device ID requis");
+        socket.emit("registration_error", { error: "Device ID requis" });
         return;
       }
       
       const connection = await pool.getConnection();
       
-      // Rechercher ou créer l'utilisateur
-      const [existingUsers] = await connection.execute(
-        "SELECT id FROM users WHERE device_id = ?",
-        [deviceId]
-      );
+      let userId = existingUserId;
       
-      let userId;
-      
-      if (existingUsers.length > 0) {
-        // Utilisateur existant
-        userId = existingUsers[0].id;
-        await connection.execute(
-          "UPDATE users SET last_seen = NOW() WHERE id = ?",
-          [userId]
-        );
-      } else {
-        // Nouvel utilisateur
-        const [result] = await connection.execute(
-          "INSERT INTO users (device_id) VALUES (?)",
+      if (!userId) {
+        // Chercher l'utilisateur par deviceId
+        const [existingUsers] = await connection.execute(
+          "SELECT id FROM users WHERE device_id = ?",
           [deviceId]
         );
-        userId = result.insertId;
+        
+        if (existingUsers.length > 0) {
+          userId = existingUsers[0].id;
+          await connection.execute(
+            "UPDATE users SET last_seen = NOW(), is_online = 1 WHERE id = ?",
+            [userId]
+          );
+        } else {
+          // Nouvel utilisateur
+          const [result] = await connection.execute(
+            "INSERT INTO users (device_id, is_online) VALUES (?, 1)",
+            [deviceId]
+          );
+          userId = result.insertId;
+        }
+      } else {
+        // Mettre à jour le statut
+        await connection.execute(
+          "UPDATE users SET last_seen = NOW(), is_online = 1 WHERE id = ?",
+          [userId]
+        );
       }
       
       connection.release();
       
-      // Stocker les associations
+      // Stocker les connexions
       connectedUsers.set(userId.toString(), socket.id);
-      userSockets.set(socket.id, {
-        userId: userId.toString(),
-        deviceId: deviceId
-      });
+      userDevices.set(userId.toString(), { deviceId, socketId: socket.id });
       socket.userId = userId.toString();
+      socket.deviceId = deviceId;
       
-      console.log(`✅ User ${userId} enregistré (${socket.id})`);
+      console.log(`✅ User ${userId} connecté (${socket.id})`);
       
       // Confirmer l'enregistrement
-      socket.emit("register_success", {
+      socket.emit("registration_success", {
         userId,
-        deviceId
+        deviceId,
+        socketId: socket.id
       });
       
-      // Envoyer la liste des utilisateurs après un court délai
-      setTimeout(() => {
-        emitUserList(socket);
-      }, 500);
+      // Notifier les autres utilisateurs
+      socket.broadcast.emit("user_connected", {
+        userId,
+        timestamp: Date.now()
+      });
       
-      // Diffuser la mise à jour des utilisateurs en ligne
-      setTimeout(() => {
+      // Envoyer la liste des utilisateurs
+      setTimeout(async () => {
+        await sendUserList(socket);
         broadcastOnlineUsers();
-      }, 1000);
+      }, 100);
       
     } catch (error) {
-      console.error("❌ Erreur enregistrement:", error);
-      socket.emit("register_error", error.message);
+      console.error("❌ Erreur register_user:", error);
+      socket.emit("registration_error", { error: error.message });
     }
   });
 
-  // Demande de la liste des utilisateurs
-  socket.on("get_users", async () => {
-    if (!socket.userId) return;
-    await emitUserList(socket);
-  });
-
   // Envoyer la liste des utilisateurs
-  const emitUserList = async (socket) => {
+  const sendUserList = async (socket) => {
     try {
+      if (!socket.userId) return;
+      
       const connection = await pool.getConnection();
       const [users] = await connection.execute(
-        "SELECT id, device_id FROM users WHERE id != ? ORDER BY last_seen DESC",
+        "SELECT id, device_id, is_online FROM users WHERE id != ? ORDER BY last_seen DESC",
         [socket.userId]
       );
       
       connection.release();
       
-      // Ajouter le statut en ligne
+      // Ajouter le statut en ligne depuis la Map
       const usersWithStatus = users.map(user => ({
         ...user,
-        online: connectedUsers.has(user.id.toString())
+        online: connectedUsers.has(user.id.toString()) || user.is_online === 1
       }));
       
       socket.emit("users_list", usersWithStatus);
       
-      console.log(`📋 Liste utilisateurs envoyée à ${socket.userId}`);
-      
     } catch (error) {
-      console.error("❌ Erreur emitUserList:", error);
+      console.error("❌ Erreur sendUserList:", error);
     }
   };
 
-  // Envoi de message
+  // Demande de la liste des utilisateurs
+  socket.on("get_users", async () => {
+    await sendUserList(socket);
+  });
+
+  // Envoyer un message
   socket.on("send_message", async (data) => {
     try {
       const { receiverId, message, tempId } = data;
       const senderId = socket.userId;
       
       if (!senderId) {
-        socket.emit("message_error", {
-          error: "Non enregistré",
-          tempId
+        socket.emit("message_error", { 
+          error: "Non authentifié",
+          tempId 
         });
         return;
       }
       
       if (!receiverId || !message?.trim()) {
         socket.emit("message_error", {
-          error: "Données invalides",
+          error: "Destinataire ou message invalide",
           tempId
         });
         return;
       }
       
-      console.log(`📤 ${senderId} → ${receiverId}: "${message.substring(0, 30)}..."`);
+      const messageText = message.trim();
+      console.log(`💬 ${senderId} → ${receiverId}: "${messageText.substring(0, 50)}"`);
       
       const connection = await pool.getConnection();
       
       // Sauvegarder le message
       const [result] = await connection.execute(
         "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
-        [senderId, receiverId, message.trim()]
+        [senderId, receiverId, messageText]
       );
+      
+      const messageId = result.insertId;
       
       // Récupérer le message complet
       const [messages] = await connection.execute(
-        "SELECT * FROM messages WHERE id = ?",
-        [result.insertId]
+        `SELECT m.*, 
+                u1.device_id as sender_device,
+                u2.device_id as receiver_device
+         FROM messages m
+         LEFT JOIN users u1 ON m.sender_id = u1.id
+         LEFT JOIN users u2 ON m.receiver_id = u2.id
+         WHERE m.id = ?`,
+        [messageId]
       );
       
       connection.release();
       
       const messageData = {
         ...messages[0],
-        tempId
+        tempId,
+        id: messageId
       };
       
-      // Confirmer à l'expéditeur
+      // 1. Confirmer à l'expéditeur IMMÉDIATEMENT
       socket.emit("message_sent", messageData);
-      console.log(`✅ Message ${result.insertId} sauvegardé`);
+      console.log(`✅ Message ${messageId} sauvegardé`);
       
-      // Envoyer au destinataire s'il est en ligne
+      // 2. Envoyer au destinataire en temps réel
       const receiverSocketId = connectedUsers.get(receiverId.toString());
+      
       if (receiverSocketId) {
-        io.to(receiverSocketId).emit("receive_message", messageData);
-        console.log(`📩 Message envoyé en temps réel à ${receiverId}`);
+        // Destinataire en ligne
+        io.to(receiverSocketId).emit("new_message", messageData);
+        console.log(`📩 Message ${messageId} envoyé en temps réel à ${receiverId}`);
+        
+        // Notifier l'expéditeur que le message a été délivré
+        socket.emit("message_delivered", {
+          messageId,
+          receiverId,
+          timestamp: Date.now()
+        });
+      } else {
+        // Destinataire hors ligne
+        console.log(`⚠️ Destinataire ${receiverId} hors ligne, message stocké`);
       }
       
     } catch (error) {
@@ -240,46 +279,94 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Récupération des messages
-  socket.on("get_messages", async (data) => {
+  // Récupérer une conversation
+  socket.on("get_conversation", async (data) => {
     try {
-      const { otherUserId } = data;
-      const senderId = socket.userId;
+      const { otherUserId, limit = 50 } = data;
+      const userId = socket.userId;
       
-      if (!senderId) return;
+      if (!userId) return;
       
       const connection = await pool.getConnection();
       const [messages] = await connection.execute(
-        `SELECT * FROM messages 
-         WHERE (sender_id = ? AND receiver_id = ?) 
-         OR (sender_id = ? AND receiver_id = ?) 
-         ORDER BY created_at ASC`,
-        [senderId, otherUserId, otherUserId, senderId]
+        `SELECT m.*, 
+                u1.device_id as sender_device,
+                u2.device_id as receiver_device
+         FROM messages m
+         LEFT JOIN users u1 ON m.sender_id = u1.id
+         LEFT JOIN users u2 ON m.receiver_id = u2.id
+         WHERE (m.sender_id = ? AND m.receiver_id = ?)
+            OR (m.sender_id = ? AND m.receiver_id = ?)
+         ORDER BY m.created_at ASC
+         LIMIT ?`,
+        [userId, otherUserId, otherUserId, userId, parseInt(limit)]
       );
       
       connection.release();
       
-      socket.emit("messages_list", {
-        userId: senderId,
+      socket.emit("conversation_history", {
+        userId,
         otherUserId,
-        messages
+        messages,
+        total: messages.length
       });
       
     } catch (error) {
-      console.error("❌ Erreur get_messages:", error);
+      console.error("❌ Erreur get_conversation:", error);
+      socket.emit("conversation_error", { error: error.message });
+    }
+  });
+
+  // Marquer les messages comme lus
+  socket.on("mark_as_read", async (data) => {
+    try {
+      const { messageIds } = data;
+      
+      if (!socket.userId || !messageIds?.length) return;
+      
+      const connection = await pool.getConnection();
+      await connection.execute(
+        "UPDATE messages SET is_read = 1 WHERE id IN (?)",
+        [messageIds]
+      );
+      connection.release();
+      
+      socket.emit("messages_read", { messageIds });
+      
+    } catch (error) {
+      console.error("❌ Erreur mark_as_read:", error);
     }
   });
 
   // Déconnexion
-  socket.on("disconnect", () => {
+  socket.on("disconnect", async () => {
     console.log(`🔴 Déconnexion: ${socket.id}`);
     
-    const userInfo = userSockets.get(socket.id);
-    if (userInfo) {
-      connectedUsers.delete(userInfo.userId);
-      userSockets.delete(socket.id);
+    if (socket.userId) {
+      const userId = socket.userId;
       
-      // Diffuser la mise à jour
+      // Retirer de la liste des connectés
+      connectedUsers.delete(userId);
+      userDevices.delete(userId);
+      
+      try {
+        const connection = await pool.getConnection();
+        await connection.execute(
+          "UPDATE users SET is_online = 0 WHERE id = ?",
+          [userId]
+        );
+        connection.release();
+      } catch (error) {
+        console.error("❌ Erreur mise à jour statut offline:", error);
+      }
+      
+      // Notifier les autres utilisateurs
+      socket.broadcast.emit("user_disconnected", {
+        userId,
+        timestamp: Date.now()
+      });
+      
+      // Mettre à jour la liste des utilisateurs en ligne
       setTimeout(() => {
         broadcastOnlineUsers();
       }, 500);
@@ -288,51 +375,60 @@ io.on("connection", (socket) => {
 });
 
 // Initialiser la base de données
-async function initializeDatabase() {
+async function initDatabase() {
   try {
     const connection = await pool.getConnection();
     
-    // Table des utilisateurs
+    // Table utilisateurs
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
         device_id VARCHAR(255) UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_online TINYINT DEFAULT 0,
         last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_device_id (device_id),
-        INDEX idx_last_seen (last_seen)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_device (device_id),
+        INDEX idx_online (is_online)
       )
     `);
     
-    // Table des messages
+    // Table messages
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS messages (
         id INT AUTO_INCREMENT PRIMARY KEY,
         sender_id INT NOT NULL,
         receiver_id INT NOT NULL,
         message TEXT NOT NULL,
+        is_read TINYINT DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
-        FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE,
         INDEX idx_conversation (sender_id, receiver_id, created_at),
-        INDEX idx_created_at (created_at)
+        INDEX idx_receiver (receiver_id, is_read),
+        FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (receiver_id) REFERENCES users(id) ON DELETE CASCADE
       )
     `);
     
     await connection.ping();
     connection.release();
     
-    console.log("✅ Base de données initialisée");
+    console.log("✅ Base de données initialisée avec succès");
     
   } catch (error) {
     console.error("❌ Erreur initialisation DB:", error);
+    process.exit(1);
   }
 }
 
 // Démarrer le serveur
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, async () => {
-  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+  console.log(`🚀 Serveur de chat démarré sur le port ${PORT}`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
   
-  await initializeDatabase();
+  await initDatabase();
+  
+  // Nettoyer les connexions périodiquement
+  setInterval(() => {
+    console.log(`👥 Statistiques: ${connectedUsers.size} utilisateurs connectés`);
+  }, 30000);
 });

@@ -19,18 +19,23 @@ const pool = mysql.createPool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Stockage en mémoire pour les sockets actifs
+// Stockage en mémoire
 const userSockets = new Map(); // { userId: socketId }
 const socketUsers = new Map(); // { socketId: userId }
+
+// URLs du serveur
+const SERVER_URL = "https://chatapps1backend.onrender.com";
+const SERVER_WS_URL = "wss://chatapps1backend.onrender.com";
 
 // Middleware CORS pour production
 app.use((req, res, next) => {
   const allowedOrigins = [
-    'https://chatapps1backend.onrender.com',
+    SERVER_URL,
     'exp://*',
     'http://localhost:*',
     'http://192.168.*:*',
-    'http://10.0.*:*'
+    'http://10.0.*:*',
+    'https://chatapps1backend.onrender.com'
   ];
   
   const origin = req.headers.origin;
@@ -58,18 +63,43 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Route de santé
+// Route racine
 app.get("/", (req, res) => {
   res.json({ 
     status: "OK", 
-    message: "Chat Server Running on Render",
-    url: "https://chatapps1backend.onrender.com",
+    message: "Chat Server Running",
+    server: SERVER_URL,
+    websocket: SERVER_WS_URL,
     database: "railway",
     timestamp: new Date().toISOString(),
     onlineUsers: userSockets.size,
-    totalUsers: userSockets.size,
-    serverTime: Date.now()
+    serverTime: Date.now(),
+    version: "1.0.0"
   });
+});
+
+// Route de santé
+app.get("/health", async (req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    await connection.ping();
+    connection.release();
+    
+    res.json({
+      status: "healthy",
+      server: SERVER_URL,
+      database: "connected",
+      onlineUsers: userSockets.size,
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "unhealthy",
+      error: error.message,
+      server: SERVER_URL,
+      timestamp: Date.now()
+    });
+  }
 });
 
 // Route de debug
@@ -77,22 +107,34 @@ app.get("/debug", async (req, res) => {
   try {
     const connection = await pool.getConnection();
     
-    // Statistiques
+    // Statistiques utilisateurs
     const [userStats] = await connection.execute(`
       SELECT 
         COUNT(*) as total_users,
-        SUM(CASE WHEN online = 1 THEN 1 ELSE 0 END) as online_users_db,
-        MIN(created_at) as first_user,
-        MAX(last_seen) as last_activity
+        SUM(CASE WHEN online = 1 THEN 1 ELSE 0 END) as online_users_db
       FROM users
     `);
     
+    // Statistiques messages
     const [messageStats] = await connection.execute(`
       SELECT 
         COUNT(*) as total_messages,
         MAX(created_at) as latest_message,
         MIN(created_at) as first_message
       FROM messages
+    `);
+    
+    // Derniers utilisateurs
+    const [recentUsers] = await connection.execute(`
+      SELECT 
+        id,
+        device_id,
+        online,
+        DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
+        DATE_FORMAT(last_seen, '%Y-%m-%d %H:%i:%s') as last_seen
+      FROM users
+      ORDER BY last_seen DESC
+      LIMIT 10
     `);
     
     // Derniers messages
@@ -102,34 +144,22 @@ app.get("/debug", async (req, res) => {
         m.sender_id,
         m.receiver_id,
         LEFT(m.message, 50) as message_preview,
-        m.created_at,
-        s.device_id as sender_device,
-        r.device_id as receiver_device
+        DATE_FORMAT(m.created_at, '%Y-%m-%d %H:%i:%s') as created_at,
+        u1.device_id as sender_device,
+        u2.device_id as receiver_device
       FROM messages m
-      LEFT JOIN users s ON m.sender_id = s.id
-      LEFT JOIN users r ON m.receiver_id = r.id
+      LEFT JOIN users u1 ON m.sender_id = u1.id
+      LEFT JOIN users u2 ON m.receiver_id = u2.id
       ORDER BY m.created_at DESC
-      LIMIT 5
-    `);
-    
-    // Derniers utilisateurs
-    const [recentUsers] = await connection.execute(`
-      SELECT 
-        id,
-        device_id,
-        online,
-        created_at,
-        last_seen
-      FROM users
-      ORDER BY last_seen DESC
-      LIMIT 5
+      LIMIT 10
     `);
     
     connection.release();
     
     res.json({
       server: {
-        url: "https://chatapps1backend.onrender.com",
+        url: SERVER_URL,
+        websocket: SERVER_WS_URL,
         uptime: process.uptime(),
         memory: process.memoryUsage(),
         timestamp: Date.now()
@@ -141,8 +171,8 @@ app.get("/debug", async (req, res) => {
         sockets_online: userSockets.size
       },
       recent: {
-        messages: recentMessages,
-        users: recentUsers
+        users: recentUsers,
+        messages: recentMessages
       },
       active_sockets: Array.from(userSockets.entries()).map(([userId, socketId]) => ({
         userId,
@@ -153,7 +183,64 @@ app.get("/debug", async (req, res) => {
   } catch (error) {
     res.status(500).json({ 
       error: error.message,
-      server: "https://chatapps1backend.onrender.com"
+      server: SERVER_URL
+    });
+  }
+});
+
+// Route pour créer un utilisateur de test
+app.post("/debug/create-user", async (req, res) => {
+  try {
+    const { device_id } = req.body;
+    
+    if (!device_id) {
+      return res.status(400).json({ 
+        error: "device_id est requis",
+        server: SERVER_URL
+      });
+    }
+    
+    const connection = await pool.getConnection();
+    
+    // Vérifier si existe déjà
+    const [existing] = await connection.execute(
+      "SELECT id FROM users WHERE device_id = ?",
+      [device_id]
+    );
+    
+    let userId;
+    let isNew = false;
+    
+    if (existing.length > 0) {
+      userId = existing[0].id;
+      console.log(`👤 Utilisateur existant #${userId}`);
+    } else {
+      // Créer nouvel utilisateur
+      const [result] = await connection.execute(
+        "INSERT INTO users (device_id, online) VALUES (?, 1)",
+        [device_id]
+      );
+      
+      userId = result.insertId;
+      isNew = true;
+      console.log(`🆕 Nouvel utilisateur #${userId} créé`);
+    }
+    
+    connection.release();
+    
+    res.json({
+      success: true,
+      userId: userId,
+      isNew: isNew,
+      device_id: device_id,
+      server: SERVER_URL,
+      timestamp: Date.now()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      server: SERVER_URL
     });
   }
 });
@@ -162,11 +249,11 @@ app.get("/debug", async (req, res) => {
 const io = new Server(server, {
   cors: {
     origin: [
-      "https://chatapps1backend.onrender.com",
-      "exp://*",
-      "http://localhost:*",
-      "http://192.168.*:*",
-      "http://10.0.*:*"
+      SERVER_URL,
+      'exp://*',
+      'http://localhost:*',
+      'http://192.168.*:*',
+      'http://10.0.*:*'
     ],
     methods: ["GET", "POST"],
     credentials: true
@@ -183,12 +270,12 @@ const io = new Server(server, {
 io.on("connection", (socket) => {
   console.log(`🔌 Nouveau client: ${socket.id} (${socket.handshake.address})`);
   
-  // Heartbeat
+  // Heartbeat pour Render
   socket.on("ping", (data) => {
     socket.emit("pong", { 
       ...data, 
       serverTime: Date.now(),
-      server: "https://chatapps1backend.onrender.com"
+      server: SERVER_URL
     });
   });
 
@@ -205,7 +292,7 @@ io.on("connection", (socket) => {
       if (!deviceId || deviceId.trim() === "") {
         socket.emit("register_error", { 
           error: "deviceId est requis",
-          server: "https://chatapps1backend.onrender.com"
+          server: SERVER_URL
         });
         return;
       }
@@ -227,7 +314,7 @@ io.on("connection", (socket) => {
           userId = existingUsers[0].id;
           console.log(`👤 Utilisateur existant #${userId} reconnecté`);
           
-          // Mettre à jour le statut et last_seen
+          // Mettre à jour le statut
           await connection.execute(
             "UPDATE users SET online = 1, last_seen = NOW() WHERE id = ?",
             [userId]
@@ -254,7 +341,7 @@ io.on("connection", (socket) => {
         userSockets.set(userId, socket.id);
         socketUsers.set(socket.id, userId);
         
-        // Joindre la room personnelle
+        // Rejoindre la room personnelle
         socket.join(`user:${userId}`);
         
         console.log(`✅ User #${userId} ↔ Socket ${socket.id} (${isNewUser ? 'new' : 'existing'})`);
@@ -266,14 +353,14 @@ io.on("connection", (socket) => {
           deviceId: deviceId,
           isNewUser: isNewUser,
           socketId: socket.id,
-          server: "https://chatapps1backend.onrender.com",
+          server: SERVER_URL,
           timestamp: Date.now()
         });
         
-        // Mettre à jour la liste des utilisateurs pour tous
+        // Mettre à jour la liste des utilisateurs
         broadcastOnlineUsers();
         
-        // Envoyer la liste des utilisateurs après un court délai
+        // Envoyer la liste des utilisateurs
         setTimeout(() => {
           if (socket.connected) {
             sendUsersList(socket);
@@ -282,36 +369,47 @@ io.on("connection", (socket) => {
         
       } catch (dbError) {
         connection.release();
-        console.error("❌ Erreur base de données register:", {
-          error: dbError.message,
-          code: dbError.code,
-          sql: dbError.sql,
-          deviceId: deviceId.substring(0, 30) + '...'
-        });
         
-        // Mode temporaire en cas d'erreur
-        const tempUserId = Math.floor(Math.random() * 9000) + 1000;
-        socket.userId = tempUserId;
-        
-        socket.emit("registered", {
-          success: true,
-          userId: tempUserId,
-          deviceId: deviceId,
-          isTemporary: true,
-          warning: "Mode temporaire - erreur DB",
-          server: "https://chatapps1backend.onrender.com",
-          timestamp: Date.now()
-        });
-        
-        console.log(`⚠️ Mode temporaire User #${tempUserId} pour ${socket.id}`);
+        // Gérer les doublons
+        if (dbError.code === 'ER_DUP_ENTRY') {
+          console.log(`⚠️ Device ID dupliqué, récupération de l'utilisateur existant...`);
+          
+          const conn = await pool.getConnection();
+          const [users] = await conn.execute(
+            "SELECT id FROM users WHERE device_id = ?",
+            [deviceId.trim()]
+          );
+          conn.release();
+          
+          if (users.length > 0) {
+            const userId = users[0].id;
+            socket.userId = userId;
+            userSockets.set(userId, socket.id);
+            socketUsers.set(socket.id, userId);
+            
+            socket.emit("registered", {
+              success: true,
+              userId: userId,
+              deviceId: deviceId,
+              isNewUser: false,
+              warning: "Device ID existant réutilisé",
+              server: SERVER_URL,
+              timestamp: Date.now()
+            });
+            
+            console.log(`✅ User #${userId} récupéré (device_id dupliqué)`);
+          }
+        } else {
+          throw dbError;
+        }
       }
       
     } catch (error) {
-      console.error("❌ Erreur générale register:", error);
+      console.error("❌ Erreur register:", error);
       socket.emit("register_error", { 
         error: "Erreur serveur",
         details: error.message,
-        server: "https://chatapps1backend.onrender.com"
+        server: SERVER_URL
       });
     }
   });
@@ -320,10 +418,10 @@ io.on("connection", (socket) => {
   socket.on("get_users", async () => {
     try {
       if (!socket.userId) {
-        console.log(`❌ get_users: socket ${socket.id} non authentifié`);
+        console.log(`❌ get_users: socket non authentifié`);
         socket.emit("users_error", { 
           error: "Non authentifié - register d'abord",
-          server: "https://chatapps1backend.onrender.com"
+          server: SERVER_URL
         });
         return;
       }
@@ -335,39 +433,28 @@ io.on("connection", (socket) => {
       console.error("❌ Erreur get_users:", error);
       socket.emit("users_error", { 
         error: error.message,
-        server: "https://chatapps1backend.onrender.com"
+        server: SERVER_URL
       });
     }
   });
 
   // ============ 3. ENVOYER UN MESSAGE ============
   socket.on("send_message", async (data) => {
-    const startTime = Date.now();
+    console.log(`📤 send_message: User #${socket.userId} → User #${data.to}`, {
+      textLength: data.text?.length || 0,
+      socket: socket.id
+    });
     
     try {
       const { to, text } = data;
       const from = socket.userId;
       
-      console.log(`📤 send_message: User #${from} → User #${to}`, {
-        textLength: text?.length || 0,
-        textPreview: text ? text.substring(0, 50) + (text.length > 50 ? '...' : '') : 'empty',
-        socket: socket.id
-      });
-      
-      // Validation stricte
+      // Validation
       if (!from || !to || !text || text.trim() === "") {
-        console.error("❌ Validation failed:", { from, to, text: text ? 'present' : 'missing' });
+        console.error("❌ Données invalides");
         socket.emit("message_error", { 
           error: "Données invalides: from, to et text requis",
-          server: "https://chatapps1backend.onrender.com"
-        });
-        return;
-      }
-      
-      if (from.toString() === to.toString()) {
-        socket.emit("message_error", { 
-          error: "Impossible de s'envoyer un message à soi-même",
-          server: "https://chatapps1backend.onrender.com"
+          server: SERVER_URL
         });
         return;
       }
@@ -377,7 +464,7 @@ io.on("connection", (socket) => {
       try {
         // Vérifier que le destinataire existe
         const [recipientCheck] = await connection.execute(
-          "SELECT id, device_id FROM users WHERE id = ?",
+          "SELECT id FROM users WHERE id = ?",
           [to]
         );
         
@@ -386,44 +473,31 @@ io.on("connection", (socket) => {
           console.error(`❌ Destinataire User #${to} non trouvé`);
           socket.emit("message_error", { 
             error: `Destinataire User #${to} non trouvé`,
-            server: "https://chatapps1backend.onrender.com"
+            server: SERVER_URL
           });
           return;
         }
         
-        // INSÉRER LE MESSAGE DANS LA BASE
+        // INSÉRER LE MESSAGE
         const [insertResult] = await connection.execute(
           "INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)",
           [from, to, text.trim()]
         );
         
         const messageId = insertResult.insertId;
-        console.log(`✅ Message #${messageId} inséré en DB (${Date.now() - startTime}ms)`);
+        console.log(`✅ Message #${messageId} inséré dans la base`);
         
-        // RÉCUPÉRER LE MESSAGE COMPLET AVEC TIMESTAMP FORMATÉ
+        // RÉCUPÉRER LE MESSAGE
         const [messages] = await connection.execute(
           `SELECT 
             m.*,
-            DATE_FORMAT(m.created_at, '%Y-%m-%dT%TZ') as created_at_iso,
-            s.device_id as sender_device_id,
-            r.device_id as receiver_device_id
+            DATE_FORMAT(m.created_at, '%Y-%m-%dT%TZ') as created_at_iso
            FROM messages m
-           LEFT JOIN users s ON m.sender_id = s.id
-           LEFT JOIN users r ON m.receiver_id = r.id
            WHERE m.id = ?`,
           [messageId]
         );
         
         connection.release();
-        
-        if (messages.length === 0) {
-          console.error(`❌ Message #${messageId} inséré mais non retrouvé`);
-          socket.emit("message_error", { 
-            error: "Erreur de récupération du message",
-            server: "https://chatapps1backend.onrender.com"
-          });
-          return;
-        }
         
         const messageData = messages[0];
         
@@ -433,29 +507,20 @@ io.on("connection", (socket) => {
           sender_id: parseInt(messageData.sender_id),
           receiver_id: parseInt(messageData.receiver_id),
           message: messageData.message,
-          created_at: messageData.created_at_iso || messageData.created_at,
-          sender_device_id: messageData.sender_device_id,
-          receiver_device_id: messageData.receiver_device_id
+          created_at: messageData.created_at_iso || messageData.created_at
         };
         
-        console.log(`📊 Message #${messageId} formaté:`, {
-          sender: formattedMessage.sender_id,
-          receiver: formattedMessage.receiver_id,
-          timestamp: formattedMessage.created_at
-        });
-        
-        // 1. CONFIRMER À L'EXPÉDITEUR IMMÉDIATEMENT
+        // 1. CONFIRMER À L'EXPÉDITEUR
         socket.emit("message_sent", {
           success: true,
           message: formattedMessage,
-          server: "https://chatapps1backend.onrender.com",
-          timestamp: Date.now(),
-          insertTime: Date.now() - startTime
+          server: SERVER_URL,
+          timestamp: Date.now()
         });
         
         console.log(`✅ Confirmation envoyée à expéditeur User #${from}`);
         
-        // 2. ENVOYER AU DESTINATAIRE EN TEMPS RÉEL
+        // 2. ENVOYER AU DESTINATAIRE
         const recipientSocketId = userSockets.get(parseInt(to));
         
         if (recipientSocketId) {
@@ -464,48 +529,39 @@ io.on("connection", (socket) => {
           io.to(recipientSocketId).emit("new_message", {
             success: true,
             message: formattedMessage,
-            server: "https://chatapps1backend.onrender.com",
+            server: SERVER_URL,
             timestamp: Date.now()
           });
           
           console.log(`✅ Message délivré en temps réel à User #${to}`);
         } else {
-          console.log(`📭 Destinataire User #${to} hors ligne - Message sauvegardé en DB`);
+          console.log(`📭 Destinataire User #${to} hors ligne - Message sauvegardé`);
         }
-        
-        console.log(`✅ Process complet: ${Date.now() - startTime}ms`);
         
       } catch (dbError) {
         connection.release();
-        console.error("❌ Erreur DB send_message:", {
-          error: dbError.message,
-          code: dbError.code,
-          sql: dbError.sql,
-          from: from,
-          to: to
-        });
+        console.error("❌ Erreur DB send_message:", dbError.message);
         
         socket.emit("message_error", { 
           error: "Erreur base de données",
           details: dbError.message,
-          code: dbError.code,
-          server: "https://chatapps1backend.onrender.com"
+          server: SERVER_URL
         });
       }
       
     } catch (error) {
-      console.error("❌ Erreur générale send_message:", error);
+      console.error("❌ Erreur send_message:", error);
       socket.emit("message_error", { 
         error: error.message,
-        server: "https://chatapps1backend.onrender.com"
+        server: SERVER_URL
       });
     }
   });
 
-  // ============ 4. CHARGER L'HISTORIQUE DES MESSAGES ============
+  // ============ 4. CHARGER L'HISTORIQUE ============
   socket.on("get_messages", async (data) => {
     try {
-      const { with: otherUserId, limit = 50 } = data;
+      const { with: otherUserId } = data;
       const userId = socket.userId;
       
       console.log(`📜 get_messages: User #${userId} avec User #${otherUserId}`);
@@ -513,7 +569,7 @@ io.on("connection", (socket) => {
       if (!userId || !otherUserId) {
         socket.emit("messages_error", { 
           error: "Paramètres manquants",
-          server: "https://chatapps1backend.onrender.com"
+          server: SERVER_URL
         });
         return;
       }
@@ -523,17 +579,13 @@ io.on("connection", (socket) => {
       const [messages] = await connection.execute(
         `SELECT 
           m.*,
-          DATE_FORMAT(m.created_at, '%Y-%m-%dT%TZ') as created_at_iso,
-          s.device_id as sender_device_id,
-          r.device_id as receiver_device_id
+          DATE_FORMAT(m.created_at, '%Y-%m-%dT%TZ') as created_at_iso
          FROM messages m
-         LEFT JOIN users s ON m.sender_id = s.id
-         LEFT JOIN users r ON m.receiver_id = r.id
          WHERE (m.sender_id = ? AND m.receiver_id = ?) 
             OR (m.sender_id = ? AND m.receiver_id = ?)
          ORDER BY m.created_at ASC
-         LIMIT ?`,
-        [userId, otherUserId, otherUserId, userId, parseInt(limit)]
+         LIMIT 50`,
+        [userId, otherUserId, otherUserId, userId]
       );
       
       connection.release();
@@ -544,19 +596,17 @@ io.on("connection", (socket) => {
         sender_id: parseInt(msg.sender_id),
         receiver_id: parseInt(msg.receiver_id),
         message: msg.message,
-        created_at: msg.created_at_iso || msg.created_at,
-        sender_device_id: msg.sender_device_id,
-        receiver_device_id: msg.receiver_device_id
+        created_at: msg.created_at_iso || msg.created_at
       }));
       
-      console.log(`📜 ${formattedMessages.length} messages chargés entre ${userId} et ${otherUserId}`);
+      console.log(`📜 ${formattedMessages.length} messages chargés`);
       
       socket.emit("messages", {
         success: true,
         with: otherUserId,
         messages: formattedMessages,
         count: formattedMessages.length,
-        server: "https://chatapps1backend.onrender.com",
+        server: SERVER_URL,
         timestamp: Date.now()
       });
       
@@ -564,7 +614,7 @@ io.on("connection", (socket) => {
       console.error("❌ Erreur get_messages:", error);
       socket.emit("messages_error", { 
         error: error.message,
-        server: "https://chatapps1backend.onrender.com"
+        server: SERVER_URL
       });
     }
   });
@@ -585,7 +635,7 @@ io.on("connection", (socket) => {
         connection.release();
         console.log(`✅ User #${userId} marqué hors ligne`);
       } catch (error) {
-        console.error(`❌ Erreur update déconnexion User #${userId}:`, error);
+        console.error(`❌ Erreur update déconnexion:`, error);
       }
       
       userSockets.delete(userId);
@@ -598,7 +648,6 @@ io.on("connection", (socket) => {
 
 // ================= FONCTIONS UTILITAIRES =================
 
-// Envoyer la liste des utilisateurs à un socket
 async function sendUsersList(socket) {
   try {
     const connection = await pool.getConnection();
@@ -628,7 +677,7 @@ async function sendUsersList(socket) {
       success: true,
       users: usersWithStatus,
       count: usersWithStatus.length,
-      server: "https://chatapps1backend.onrender.com",
+      server: SERVER_URL,
       timestamp: Date.now()
     });
     
@@ -638,74 +687,56 @@ async function sendUsersList(socket) {
     console.error("❌ Erreur sendUsersList:", error);
     socket.emit("users_error", { 
       error: error.message,
-      server: "https://chatapps1backend.onrender.com"
+      server: SERVER_URL
     });
   }
 }
 
-// Diffuser les utilisateurs en ligne à tous
+// Diffuser les utilisateurs en ligne
 function broadcastOnlineUsers() {
   const onlineUsers = Array.from(userSockets.keys());
   
   io.emit("online_users_update", {
     onlineUsers: onlineUsers,
     count: onlineUsers.length,
-    server: "https://chatapps1backend.onrender.com",
+    server: SERVER_URL,
     timestamp: Date.now()
   });
   
   console.log(`📡 Mise à jour broadcast: ${onlineUsers.length} utilisateurs en ligne`);
 }
 
-// Vérifier la base de données au démarrage
+// Vérifier la base de données
 async function initDatabase() {
   try {
     const connection = await pool.getConnection();
     
-    // Vérifier les tables
-    const [usersTable] = await connection.execute(`
-      SELECT 
-        TABLE_NAME,
-        ENGINE,
-        TABLE_ROWS,
-        CREATE_TIME
-      FROM information_schema.TABLES 
-      WHERE TABLE_SCHEMA = 'railway' AND TABLE_NAME = 'users'
-    `);
-    
-    const [messagesTable] = await connection.execute(`
-      SELECT 
-        TABLE_NAME,
-        ENGINE,
-        TABLE_ROWS,
-        CREATE_TIME
-      FROM information_schema.TABLES 
-      WHERE TABLE_SCHEMA = 'railway' AND TABLE_NAME = 'messages'
-    `);
+    // Vérifier la connexion
+    await connection.ping();
     
     // Statistiques
     const [userStats] = await connection.execute(`
       SELECT 
-        COUNT(*) as total,
-        SUM(online) as online_count
+        COUNT(*) as total_users,
+        SUM(CASE WHEN online = 1 THEN 1 ELSE 0 END) as online_users
       FROM users
     `);
     
     const [messageStats] = await connection.execute(`
       SELECT 
-        COUNT(*) as total,
-        MAX(created_at) as latest,
-        MIN(created_at) as earliest
+        COUNT(*) as total_messages,
+        MAX(created_at) as latest_message
       FROM messages
     `);
     
     connection.release();
     
     console.log("=== BASE DE DONNÉES RAILWAY ===");
-    console.log("📊 Utilisateurs:", userStats[0].total, `(${userStats[0].online_count} en ligne)`);
-    console.log("📊 Messages:", messageStats[0].total);
-    if (messageStats[0].latest) {
-      console.log("📅 Dernier message:", messageStats[0].latest);
+    console.log(`🔗 URL: ${SERVER_URL}`);
+    console.log(`👥 Utilisateurs: ${userStats[0].total_users} (${userStats[0].online_users} en ligne)`);
+    console.log(`💬 Messages: ${messageStats[0].total_messages}`);
+    if (messageStats[0].latest_message) {
+      console.log(`📅 Dernier message: ${messageStats[0].latest_message}`);
     }
     console.log("✅ Base de données prête");
     console.log("===============================");
@@ -727,10 +758,11 @@ process.on("unhandledRejection", (reason, promise) => {
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`🚀 Serveur de production démarré sur le port ${PORT}`);
-  console.log(`🔗 URL Render: https://chatapps1backend.onrender.com`);
-  console.log(`📡 WebSocket: wss://chatapps1backend.onrender.com`);
-  console.log(`🌐 Debug: https://chatapps1backend.onrender.com/debug`);
-  console.log(`🗄️  Database: Railway MySQL`);
+  console.log(`🔗 URL Render: ${SERVER_URL}`);
+  console.log(`📡 WebSocket: ${SERVER_WS_URL}`);
+  console.log(`🌐 API Health: ${SERVER_URL}/health`);
+  console.log(`🔍 Debug: ${SERVER_URL}/debug`);
+  console.log(`🗄️  Database: Railway MySQL (centerbeam.proxy.rlwy.net:44341)`);
   console.log("===========================================");
   
   initDatabase();

@@ -729,36 +729,46 @@ io.on("connection", (socket) => {
   });
 
   // ============ 5. MISE À JOUR DU TOKEN PUSH ============
-  socket.on("update_push_token", async (data) => {
-    try {
-      const { expoPushToken } = data;
-      const userId = socket.userId;
-      
-      if (!userId || !expoPushToken) {
-        return;
-      }
-      
-      const connection = await pool.getConnection();
-      
-      await connection.execute(
-        "UPDATE users SET expo_push_token = ? WHERE id = ?",
-        [expoPushToken, userId]
-      );
-      
-      connection.release();
-      
-      console.log(`✅ Token push mis à jour pour User #${userId}`);
-      
-      socket.emit("push_token_updated", {
-        success: true,
-        server: SERVER_URL,
-        timestamp: Date.now()
-      });
-      
-    } catch (error) {
-      console.error(`❌ Erreur mise à jour token push:`, error);
+  // Dans la route update_push_token
+socket.on("update_push_token", async (data) => {
+  try {
+    const { expoPushToken } = data;
+    const userId = socket.userId;
+    
+    console.log("📥 update_push_token reçu:", {
+      userId: userId,
+      token: expoPushToken,
+      tokenLength: expoPushToken?.length
+    });
+    
+    if (!userId || !expoPushToken) {
+      console.log("❌ Données manquantes");
+      return;
     }
-  });
+    
+    const connection = await pool.getConnection();
+    
+    // DIRECTEMENT insérer le token (déjà nettoyé)
+    await connection.execute(
+      "UPDATE users SET expo_push_token = ? WHERE id = ?",
+      [expoPushToken, userId]
+    );
+    
+    connection.release();
+    
+    console.log(`✅ Token inséré pour User #${userId}: ${expoPushToken.substring(0, 20)}...`);
+    
+    socket.emit("push_token_updated", {
+      success: true,
+      message: "Token push mis à jour",
+      server: SERVER_URL,
+      timestamp: Date.now()
+    });
+    
+  } catch (error) {
+    console.error(`❌ Erreur insertion token:`, error);
+  }
+});
 
   // ============ 6. DÉCONNEXION ============
   socket.on("disconnect", async (reason) => {

@@ -2,9 +2,13 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
+const { Expo } = require('expo-server-sdk');
 
 const app = express();
 const server = http.createServer(app);
+
+// Créez une instance Expo
+const expo = new Expo();
 
 // Configuration MySQL Railway
 const pool = mysql.createPool({
@@ -26,6 +30,42 @@ const socketUsers = new Map(); // { socketId: userId }
 // URLs du serveur
 const SERVER_URL = "https://chatapps1backend.onrender.com";
 const SERVER_WS_URL = "wss://chatapps1backend.onrender.com";
+
+// ================= FONCTIONS UTILITAIRES =================
+
+// Fonction pour envoyer des notifications push
+async function sendPushNotification(pushToken, title, body, data = {}) {
+  try {
+    if (!pushToken || !Expo.isExpoPushToken(pushToken)) {
+      console.log(`❌ Token push invalide ou manquant`);
+      return false;
+    }
+
+    const message = {
+      to: pushToken,
+      sound: 'default',
+      title: title,
+      body: body,
+      data: data,
+      priority: 'high',
+      badge: 1
+    };
+
+    const tickets = await expo.sendPushNotificationsAsync([message]);
+    
+    const ticket = tickets[0];
+    if (ticket.status === 'ok') {
+      console.log(`✅ Notification envoyée`);
+      return true;
+    } else {
+      console.log(`❌ Échec notification: ${ticket.message}`);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Erreur envoi notification:', error);
+    return false;
+  }
+}
 
 // Middleware CORS pour production
 app.use((req, res, next) => {
@@ -287,7 +327,7 @@ io.on("connection", (socket) => {
     });
     
     try {
-      const { deviceId } = data;
+      const { deviceId, expoPushToken } = data;
       
       if (!deviceId || deviceId.trim() === "") {
         socket.emit("register_error", { 
@@ -314,19 +354,36 @@ io.on("connection", (socket) => {
           userId = existingUsers[0].id;
           console.log(`👤 Utilisateur existant #${userId} reconnecté`);
           
-          // Mettre à jour le statut
-          await connection.execute(
-            "UPDATE users SET online = 1, last_seen = NOW() WHERE id = ?",
-            [userId]
-          );
+          // Mettre à jour le statut et le token push si fourni
+          if (expoPushToken) {
+            await connection.execute(
+              "UPDATE users SET online = 1, last_seen = NOW(), expo_push_token = ? WHERE id = ?",
+              [expoPushToken, userId]
+            );
+            console.log(`🔔 Token push mis à jour pour User #${userId}`);
+          } else {
+            await connection.execute(
+              "UPDATE users SET online = 1, last_seen = NOW() WHERE id = ?",
+              [userId]
+            );
+          }
         } else {
           // Nouvel utilisateur
           console.log(`🆕 Création nouvel utilisateur pour: ${deviceId.substring(0, 30)}...`);
           
-          const [result] = await connection.execute(
-            "INSERT INTO users (device_id, online) VALUES (?, 1)",
-            [deviceId.trim()]
-          );
+          // Insérer avec token push si disponible
+          if (expoPushToken) {
+            const [result] = await connection.execute(
+              "INSERT INTO users (device_id, online, expo_push_token) VALUES (?, 1, ?)",
+              [deviceId.trim(), expoPushToken]
+            );
+            console.log(`🔔 Nouvel utilisateur avec token push`);
+          } else {
+            const [result] = await connection.execute(
+              "INSERT INTO users (device_id, online) VALUES (?, 1)",
+              [deviceId.trim()]
+            );
+          }
           
           userId = result.insertId;
           isNewUser = true;
@@ -386,6 +443,16 @@ io.on("connection", (socket) => {
             socket.userId = userId;
             userSockets.set(userId, socket.id);
             socketUsers.set(socket.id, userId);
+            
+            // Mettre à jour le token push si fourni
+            if (expoPushToken) {
+              const conn2 = await pool.getConnection();
+              await conn2.execute(
+                "UPDATE users SET expo_push_token = ? WHERE id = ?",
+                [expoPushToken, userId]
+              );
+              conn2.release();
+            }
             
             socket.emit("registered", {
               success: true,
@@ -497,9 +564,18 @@ io.on("connection", (socket) => {
           [messageId]
         );
         
+        const messageData = messages[0];
+        
+        // Récupérer le token push du destinataire
+        const [recipientData] = await connection.execute(
+          "SELECT expo_push_token, device_id FROM users WHERE id = ?",
+          [to]
+        );
+        
         connection.release();
         
-        const messageData = messages[0];
+        const recipientPushToken = recipientData[0]?.expo_push_token;
+        const recipientDeviceId = recipientData[0]?.device_id || `User #${to}`;
         
         // Formater pour le client
         const formattedMessage = {
@@ -536,6 +612,39 @@ io.on("connection", (socket) => {
           console.log(`✅ Message délivré en temps réel à User #${to}`);
         } else {
           console.log(`📭 Destinataire User #${to} hors ligne - Message sauvegardé`);
+          
+          // Envoyer une notification push si le destinataire a un token
+          if (recipientPushToken) {
+            try {
+              // Récupérer les infos de l'expéditeur
+              const conn = await pool.getConnection();
+              const [senderData] = await conn.execute(
+                "SELECT device_id FROM users WHERE id = ?",
+                [from]
+              );
+              conn.release();
+              
+              const senderDeviceId = senderData[0]?.device_id || `User #${from}`;
+              
+              await sendPushNotification(
+                recipientPushToken,
+                `Message de ${senderDeviceId}`,
+                text.length > 100 ? text.substring(0, 100) + '...' : text,
+                {
+                  type: 'new_message',
+                  sender_id: from,
+                  message_id: messageId,
+                  sender_device: senderDeviceId,
+                  server: SERVER_URL,
+                  timestamp: Date.now()
+                }
+              );
+              
+              console.log(`🔔 Notification push envoyée à User #${to}`);
+            } catch (pushError) {
+              console.error(`❌ Erreur envoi notification push:`, pushError);
+            }
+          }
         }
         
       } catch (dbError) {
@@ -579,7 +688,7 @@ io.on("connection", (socket) => {
       const [messages] = await connection.execute(
         `SELECT 
           m.*,
-          DATE_FORMAT(m.created_at, '%Y-%m-%dT%TZ') as created_at_iso
+          DATE_FORMAT(m.created_at, '%Y-%m-dT%TZ') as created_at_iso
          FROM messages m
          WHERE (m.sender_id = ? AND m.receiver_id = ?) 
             OR (m.sender_id = ? AND m.receiver_id = ?)
@@ -619,7 +728,39 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ============ 5. DÉCONNEXION ============
+  // ============ 5. MISE À JOUR DU TOKEN PUSH ============
+  socket.on("update_push_token", async (data) => {
+    try {
+      const { expoPushToken } = data;
+      const userId = socket.userId;
+      
+      if (!userId || !expoPushToken) {
+        return;
+      }
+      
+      const connection = await pool.getConnection();
+      
+      await connection.execute(
+        "UPDATE users SET expo_push_token = ? WHERE id = ?",
+        [expoPushToken, userId]
+      );
+      
+      connection.release();
+      
+      console.log(`✅ Token push mis à jour pour User #${userId}`);
+      
+      socket.emit("push_token_updated", {
+        success: true,
+        server: SERVER_URL,
+        timestamp: Date.now()
+      });
+      
+    } catch (error) {
+      console.error(`❌ Erreur mise à jour token push:`, error);
+    }
+  });
+
+  // ============ 6. DÉCONNEXION ============
   socket.on("disconnect", async (reason) => {
     console.log(`🔴 Déconnexion: ${socket.id} (${reason})`);
     

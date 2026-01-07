@@ -323,6 +323,8 @@ io.on("connection", (socket) => {
   socket.on("register", async (data) => {
     console.log(`📱 Register request from ${socket.id}:`, {
       deviceId: data.deviceId ? data.deviceId.substring(0, 30) + '...' : 'none',
+      hasExpoToken: !!data.expoPushToken,
+      tokenLength: data.expoPushToken?.length || 0,
       timestamp: Date.now()
     });
     
@@ -337,12 +339,29 @@ io.on("connection", (socket) => {
         return;
       }
       
+      // VALIDATION DU TOKEN EXPO
+      let validToken = null;
+      if (expoPushToken) {
+        // Vérifier que c'est un token Expo valide
+        if (expoPushToken.includes('ExponentPushToken[') && expoPushToken.includes(']')) {
+          validToken = expoPushToken;
+          console.log(`✅ Token Expo valide reçu: ${validToken.substring(0, 50)}...`);
+        } else {
+          console.warn(`⚠️ Format token Expo invalide: ${expoPushToken.substring(0, 50)}...`);
+          // Essayer de le nettoyer
+          if (expoPushToken.startsWith('ExponentPushToken') && expoPushToken.length > 20) {
+            validToken = expoPushToken;
+            console.log(`🔄 Token accepté malgré format suspect`);
+          }
+        }
+      }
+      
       const connection = await pool.getConnection();
       
       try {
         // Vérifier si l'utilisateur existe déjà
         const [existingUsers] = await connection.execute(
-          "SELECT id, device_id, online FROM users WHERE device_id = ?",
+          "SELECT id, device_id, online, expo_push_token FROM users WHERE device_id = ?",
           [deviceId.trim()]
         );
         
@@ -355,12 +374,22 @@ io.on("connection", (socket) => {
           console.log(`👤 Utilisateur existant #${userId} reconnecté`);
           
           // Mettre à jour le statut et le token push si fourni
-          if (expoPushToken) {
-            await connection.execute(
-              "UPDATE users SET online = 1, last_seen = NOW(), expo_push_token = ? WHERE id = ?",
-              [expoPushToken, userId]
-            );
-            console.log(`🔔 Token push mis à jour pour User #${userId}`);
+          if (validToken) {
+            // Vérifier si le token est différent de celui enregistré
+            const currentToken = existingUsers[0].expo_push_token;
+            if (currentToken !== validToken) {
+              await connection.execute(
+                "UPDATE users SET online = 1, last_seen = NOW(), expo_push_token = ? WHERE id = ?",
+                [validToken, userId]
+              );
+              console.log(`🔔 Token push MIS À JOUR pour User #${userId}: ${validToken.substring(0, 30)}...`);
+            } else {
+              await connection.execute(
+                "UPDATE users SET online = 1, last_seen = NOW() WHERE id = ?",
+                [userId]
+              );
+              console.log(`🔔 Token push DÉJÀ À JOUR pour User #${userId}`);
+            }
           } else {
             await connection.execute(
               "UPDATE users SET online = 1, last_seen = NOW() WHERE id = ?",
@@ -372,12 +401,12 @@ io.on("connection", (socket) => {
           console.log(`🆕 Création nouvel utilisateur pour: ${deviceId.substring(0, 30)}...`);
           
           // Insérer avec token push si disponible
-          if (expoPushToken) {
+          if (validToken) {
             const [result] = await connection.execute(
               "INSERT INTO users (device_id, online, expo_push_token) VALUES (?, 1, ?)",
-              [deviceId.trim(), expoPushToken]
+              [deviceId.trim(), validToken]
             );
-            console.log(`🔔 Nouvel utilisateur avec token push`);
+            console.log(`🔔 Nouvel utilisateur avec token push créé`);
           } else {
             const [result] = await connection.execute(
               "INSERT INTO users (device_id, online) VALUES (?, 1)",
@@ -410,6 +439,7 @@ io.on("connection", (socket) => {
           deviceId: deviceId,
           isNewUser: isNewUser,
           socketId: socket.id,
+          expoTokenSaved: !!validToken,
           server: SERVER_URL,
           timestamp: Date.now()
         });
@@ -433,26 +463,29 @@ io.on("connection", (socket) => {
           
           const conn = await pool.getConnection();
           const [users] = await conn.execute(
-            "SELECT id FROM users WHERE device_id = ?",
+            "SELECT id, expo_push_token FROM users WHERE device_id = ?",
             [deviceId.trim()]
           );
           conn.release();
           
           if (users.length > 0) {
             const userId = users[0].id;
-            socket.userId = userId;
-            userSockets.set(userId, socket.id);
-            socketUsers.set(socket.id, userId);
+            const currentToken = users[0].expo_push_token;
             
-            // Mettre à jour le token push si fourni
-            if (expoPushToken) {
+            // Mettre à jour le token push seulement s'il est fourni ET différent
+            if (validToken && currentToken !== validToken) {
               const conn2 = await pool.getConnection();
               await conn2.execute(
                 "UPDATE users SET expo_push_token = ? WHERE id = ?",
-                [expoPushToken, userId]
+                [validToken, userId]
               );
               conn2.release();
+              console.log(`🔔 Token push MIS À JOUR (doublon résolu) pour User #${userId}`);
             }
+            
+            socket.userId = userId;
+            userSockets.set(userId, socket.id);
+            socketUsers.set(socket.id, userId);
             
             socket.emit("registered", {
               success: true,
@@ -460,6 +493,7 @@ io.on("connection", (socket) => {
               deviceId: deviceId,
               isNewUser: false,
               warning: "Device ID existant réutilisé",
+              expoTokenUpdated: !!validToken,
               server: SERVER_URL,
               timestamp: Date.now()
             });
@@ -467,6 +501,7 @@ io.on("connection", (socket) => {
             console.log(`✅ User #${userId} récupéré (device_id dupliqué)`);
           }
         } else {
+          console.error(`❌ Erreur DB register:`, dbError);
           throw dbError;
         }
       }
@@ -729,46 +764,177 @@ io.on("connection", (socket) => {
   });
 
   // ============ 5. MISE À JOUR DU TOKEN PUSH ============
-  // Dans la route update_push_token
-socket.on("update_push_token", async (data) => {
-  try {
-    const { expoPushToken } = data;
-    const userId = socket.userId;
-    
-    console.log("📥 update_push_token reçu:", {
-      userId: userId,
-      token: expoPushToken,
-      tokenLength: expoPushToken?.length
-    });
-    
-    if (!userId || !expoPushToken) {
-      console.log("❌ Données manquantes");
-      return;
+  socket.on("update_push_token", async (data) => {
+    try {
+      const { expoPushToken } = data;
+      const userId = socket.userId;
+      
+      console.log("📥 update_push_token reçu:", {
+        userId: userId,
+        hasToken: !!expoPushToken,
+        tokenLength: expoPushToken?.length || 0,
+        socket: socket.id
+      });
+      
+      if (!userId) {
+        console.log("❌ update_push_token: Utilisateur non authentifié");
+        socket.emit("push_token_error", {
+          success: false,
+          error: "Non authentifié",
+          server: SERVER_URL
+        });
+        return;
+      }
+      
+      if (!expoPushToken) {
+        console.log("❌ update_push_token: Token manquant");
+        socket.emit("push_token_error", {
+          success: false,
+          error: "Token manquant",
+          server: SERVER_URL
+        });
+        return;
+      }
+      
+      // VALIDER LE FORMAT DU TOKEN
+      if (!expoPushToken.includes('ExponentPushToken') || expoPushToken.length < 20) {
+        console.warn(`⚠️ Format token suspect: ${expoPushToken.substring(0, 50)}...`);
+        
+        socket.emit("push_token_error", {
+          success: false,
+          error: "Format token invalide",
+          receivedToken: expoPushToken.substring(0, 30) + '...',
+          server: SERVER_URL
+        });
+        return;
+      }
+      
+      const connection = await pool.getConnection();
+      
+      try {
+        // 1. Vérifier l'utilisateur existe
+        const [userCheck] = await connection.execute(
+          "SELECT id, expo_push_token FROM users WHERE id = ?",
+          [userId]
+        );
+        
+        if (userCheck.length === 0) {
+          connection.release();
+          console.error(`❌ User #${userId} non trouvé`);
+          socket.emit("push_token_error", {
+            success: false,
+            error: "Utilisateur non trouvé",
+            server: SERVER_URL
+          });
+          return;
+        }
+        
+        const currentToken = userCheck[0].expo_push_token;
+        
+        // 2. Vérifier si le token est différent
+        if (currentToken === expoPushToken) {
+          connection.release();
+          console.log(`✅ Token déjà à jour pour User #${userId}`);
+          
+          socket.emit("push_token_updated", {
+            success: true,
+            message: "Token déjà à jour",
+            token: expoPushToken.substring(0, 30) + '...',
+            server: SERVER_URL,
+            timestamp: Date.now()
+          });
+          return;
+        }
+        
+        // 3. Mettre à jour le token
+        const [updateResult] = await connection.execute(
+          "UPDATE users SET expo_push_token = ?, last_seen = NOW() WHERE id = ?",
+          [expoPushToken, userId]
+        );
+        
+        connection.release();
+        
+        if (updateResult.affectedRows > 0) {
+          console.log(`✅ Token MIS À JOUR pour User #${userId}: ${expoPushToken.substring(0, 50)}...`);
+          
+          socket.emit("push_token_updated", {
+            success: true,
+            message: "Token push mis à jour avec succès",
+            tokenUpdated: true,
+            newTokenPreview: expoPushToken.substring(0, 30) + '...',
+            server: SERVER_URL,
+            timestamp: Date.now()
+          });
+        } else {
+          console.error(`❌ Aucune ligne affectée pour User #${userId}`);
+          socket.emit("push_token_error", {
+            success: false,
+            error: "Échec mise à jour token",
+            server: SERVER_URL
+          });
+        }
+        
+      } catch (dbError) {
+        connection.release();
+        
+        // Gérer les erreurs spécifiques MySQL
+        if (dbError.code === 'ER_DATA_TOO_LONG') {
+          console.error(`❌ Token trop long pour la colonne MySQL: ${expoPushToken.length} caractères`);
+          
+          // Essayez de le tronquer (mais cela risque de le rendre invalide)
+          const truncatedToken = expoPushToken.substring(0, 254);
+          console.log(`⚠️ Tentative avec token tronqué: ${truncatedToken.length} caractères`);
+          
+          try {
+            const conn2 = await pool.getConnection();
+            const [result] = await conn2.execute(
+              "UPDATE users SET expo_push_token = ?, last_seen = NOW() WHERE id = ?",
+              [truncatedToken, userId]
+            );
+            conn2.release();
+            
+            if (result.affectedRows > 0) {
+              console.log(`✅ Token TRONQUÉ inséré pour User #${userId}`);
+              socket.emit("push_token_warning", {
+                success: true,
+                warning: "Token tronqué (trop long pour MySQL)",
+                tokenLength: expoPushToken.length,
+                truncatedLength: truncatedToken.length,
+                tokenPreview: truncatedToken.substring(0, 30) + '...',
+                server: SERVER_URL,
+                timestamp: Date.now()
+              });
+            }
+          } catch (truncateError) {
+            console.error(`❌ Échec insertion token tronqué:`, truncateError);
+            socket.emit("push_token_error", {
+              success: false,
+              error: "Token trop long pour la base de données",
+              tokenLength: expoPushToken.length,
+              maxLength: 255,
+              server: SERVER_URL
+            });
+          }
+        } else {
+          console.error(`❌ Erreur DB update_push_token:`, dbError);
+          socket.emit("push_token_error", {
+            success: false,
+            error: "Erreur base de données",
+            details: dbError.message,
+            server: SERVER_URL
+          });
+        }
+      }
+      
+    } catch (error) {
+      console.error(`❌ Erreur update_push_token:`, error);
+      socket.emit("push_token_error", {
+        success: false,
+        error: error.message,
+        server: SERVER_URL
+      });
     }
-    
-    const connection = await pool.getConnection();
-    
-    // DIRECTEMENT insérer le token (déjà nettoyé)
-    await connection.execute(
-      "UPDATE users SET expo_push_token = ? WHERE id = ?",
-      [expoPushToken, userId]
-    );
-    
-    connection.release();
-    
-    console.log(`✅ Token inséré pour User #${userId}: ${expoPushToken.substring(0, 20)}...`);
-    
-    socket.emit("push_token_updated", {
-      success: true,
-      message: "Token push mis à jour",
-      server: SERVER_URL,
-      timestamp: Date.now()
-    });
-    
-  } catch (error) {
-    console.error(`❌ Erreur insertion token:`, error);
-  }
-});
+  });
 
   // ============ 6. DÉCONNEXION ============
   socket.on("disconnect", async (reason) => {
